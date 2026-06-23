@@ -191,34 +191,37 @@ export default function App() {
     for (const file of files) {
       try {
         const parsedData = await parsePdfFile(file);
-        
-        // Auto extract clinical report date using Gemini if key connected
-        let clinicalDate = parsedData.uploadDate;
-        if (keyState === 'valid' && parsedData.pages.length > 0) {
-          clinicalDate = await extractClinicalReportDate(
-            apiKey,
-            parsedData.name,
-            parsedData.pages[0].text,
-            parsedData.uploadDate
-          );
-        }
-
         const docId = `doc-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-        
-        // Extract Chronological Timeline items using Gemini in the background
-        let timeline: TimelineEntry[] = [];
-        if (keyState === 'valid') {
-          timeline = await extractTimelineEntries(apiKey, docId, parsedData.name, clinicalDate, parsedData.pages);
-        }
 
         const fullDoc: MedicalDocument = {
           ...parsedData,
           id: docId,
-          uploadDate: clinicalDate,
-          timelineEntries: timeline
+          uploadDate: parsedData.uploadDate,
+          timelineEntries: []
         };
 
         newlyParsedDocs.push(fullDoc);
+
+        // Extract using Gemini in the background
+        if (keyState === 'valid') {
+          if (parsedData.pages.length > 0) {
+            extractClinicalReportDate(apiKey, parsedData.name, parsedData.pages[0].text, parsedData.uploadDate)
+              .then(clinicalDate => {
+                setDocuments(prev => prev.map(d => d.id === docId ? { ...d, uploadDate: clinicalDate } : d));
+                return extractTimelineEntries(apiKey, docId, parsedData.name, clinicalDate, parsedData.pages);
+              })
+              .then(timeline => {
+                setDocuments(prev => prev.map(d => d.id === docId ? { ...d, timelineEntries: timeline } : d));
+              })
+              .catch(err => console.error("Background extraction failed:", err));
+          } else {
+            extractTimelineEntries(apiKey, docId, parsedData.name, parsedData.uploadDate, parsedData.pages)
+              .then(timeline => {
+                setDocuments(prev => prev.map(d => d.id === docId ? { ...d, timelineEntries: timeline } : d));
+              })
+              .catch(err => console.error("Background extraction failed:", err));
+          }
+        }
       } catch (err: any) {
         setUploadError(`Failed to read "${file.name}": ` + (err?.message || "File corrupt or password protected."));
       }
@@ -551,7 +554,7 @@ Continue Amlodipine 5 mg PO daily. Continue Atorvastatin 40 mg PO nightly. Next 
     const selectedText = selection.toString().trim();
     
     // Ensure we trigger on valid words, and avoid long paragraphs that degrade search performance
-    if (selectedText.length > 2 && selectedText.length < 50 && keyState === 'valid') {
+    if (selectedText.length >= 2 && selectedText.length < 50 && keyState === 'valid') {
       const range = selection.getRangeAt(0);
       const rect = range.getBoundingClientRect();
       

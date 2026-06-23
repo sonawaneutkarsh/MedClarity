@@ -32,6 +32,8 @@ export async function parsePdfFile(file: File): Promise<Omit<MedicalDocument, 'i
         pageNumber: i,
         text: pageText.trim()
       });
+      // Yield to the event loop to keep the UI responsive
+      await new Promise(resolve => setTimeout(resolve, 0));
     }
 
     // Initialize document date string from file system or today's date
