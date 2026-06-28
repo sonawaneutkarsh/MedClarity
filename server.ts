@@ -5,7 +5,7 @@ import {
   getKeyStatusResponse,
   getGeminiResponse,
   getVerifyKeyResponse,
-} from "./lib/gemini-server";
+} from "./lib/gemini-server.js";
 
 async function startServer() {
   const app = express();
