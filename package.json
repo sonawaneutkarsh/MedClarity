@@ -1,13 +1,14 @@
 {
-  "name": "react-example",
+  "name": "medclarity",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "description": "Agentic multi-document health research & Q&A assistant with cited answers and timeline analysis",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
     "start": "node dist/server.cjs",
-    "clean": "rm -rf dist server.js",
+    "clean": "rm -rf dist",
     "lint": "tsc --noEmit"
   },
   "dependencies": {
