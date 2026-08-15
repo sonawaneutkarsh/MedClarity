@@ -812,11 +812,9 @@ Continue Amlodipine 5 mg PO daily. Continue Atorvastatin 40 mg PO nightly. Next 
                   <div
                     className={`w-2.5 h-2.5 rounded-full ml-2 transition-all duration-300 ${keyState === 'valid'
                         ? 'bg-emerald-500 shadow-sm animate-glow'
-                        : keyState === 'checking'
-                          ? 'bg-amber-400'
-                          : keyState === 'invalid'
-                            ? 'bg-rose-500 shadow-xs'
-                            : 'bg-slate-300'
+                        : keyState === 'invalid'
+                          ? 'bg-rose-500 shadow-xs'
+                          : 'bg-slate-300'
                       }`}
                   />
                 </button>
