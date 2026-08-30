@@ -14,11 +14,11 @@ Upload multiple medical documents, ask a question, and get one organized answer 
 
 Medical records arrive as scattered PDFs — lab results, discharge summaries, follow-up notes — often with overlapping or conflicting information. MedClarity turns that pile of documents into a single, traceable picture:
 
-- **Citation-grounded answers — claims include page-level citations that users can inspect, although citations do not eliminate all LLM errors.** — every fact in an answer is backed by an inline `[Document Name, p.X]` citation that jumps straight to the source page.
+- **Citations you can actually check** — answers include inline `[Document Name, p.X]` references that jump straight to the source page. This makes the evidence inspectable, although citations do not eliminate every LLM error.
 - **Cross-document conflict detection** — the pipeline explicitly compares findings across reports and surfaces disagreements (different dosages, units, diagnoses) or chronological trends.
 - **Plain or clinical language** — toggle between a warm, layperson-friendly explanation and a precise clinical review of the same findings.
 - **An automatic medical timeline** — key events, treatments, and lab results are extracted and plotted chronologically across all your records.
-- **Local PDF parsing with an explicit cloud-model boundary — PDFs are parsed in the browser, while extracted text is sent to the configured Gemini API for analysis.** — PDFs are parsed entirely in your browser (PDF.js) and only the extracted text is sent to the Gemini API, using a key you provide.
+- **Your PDFs stay in the browser** — the files are parsed locally with PDF.js. Only the extracted text is sent to the configured Gemini API for analysis.
 
 > **Educational tool, not medical advice.** MedClarity helps you organize and understand your own records. Always discuss findings and treatment decisions with a qualified clinician.
 
@@ -26,7 +26,7 @@ Medical records arrive as scattered PDFs — lab results, discharge summaries, f
 
 ## How it works
 
-MedClarity runs an agentic research pipeline over your documents (skipped for small doc sets, which use a single-shot answer):
+MedClarity does more than throw every document into one giant prompt. For larger document sets, it breaks the question down, finds the relevant evidence, checks for conflicts, and then builds one cited answer. Small document sets use a faster single-shot path.
 
 1. **Plan** — the query is split into 2–4 focused clinical sub-questions, each mapped to the documents likely to contain the answer.
 2. **Retrieve & answer** — for each sub-question, the relevant documents are read page-by-page and grounded facts are extracted with the exact source page.
