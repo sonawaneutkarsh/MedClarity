@@ -14,11 +14,11 @@ Upload your medical reports and ask questions in plain language. MedClarity read
 
 Medical records arrive as scattered PDFs — lab results, discharge summaries, follow-up notes — often with overlapping or conflicting information. MedClarity turns that pile of documents into a single, traceable picture:
 
-- **Cited answers, not hallucinations** — every fact in an answer is backed by an inline `[Document Name, p.X]` citation that jumps straight to the source page.
+- **Citation-grounded answers — claims include page-level citations that users can inspect, although citations do not eliminate all LLM errors.** — every fact in an answer is backed by an inline `[Document Name, p.X]` citation that jumps straight to the source page.
 - **Cross-document conflict detection** — the pipeline explicitly compares findings across reports and surfaces disagreements (different dosages, units, diagnoses) or chronological trends.
 - **Plain or clinical language** — toggle between a warm, layperson-friendly explanation and a precise clinical review of the same findings.
 - **An automatic medical timeline** — key events, treatments, and lab results are extracted and plotted chronologically across all your records.
-- **No account, no upload-to-cloud** — PDFs are parsed entirely in your browser (PDF.js) and only the extracted text is sent to the Gemini API, using a key you provide.
+- **Local PDF parsing with an explicit cloud-model boundary — PDFs are parsed in the browser, while extracted text is sent to the configured Gemini API for analysis.** — PDFs are parsed entirely in your browser (PDF.js) and only the extracted text is sent to the Gemini API, using a key you provide.
 
 > **Educational tool, not medical advice.** MedClarity helps you organize and understand your own records. Always discuss findings and treatment decisions with a qualified clinician.
 
@@ -143,4 +143,4 @@ See [`.env.example`](.env.example) for reference.
 
 ## License
 
-Private repository — all rights reserved. Contact the maintainers for reuse terms.
+The source is publicly viewable, but no license for reuse is currently granted.
