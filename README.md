@@ -2,9 +2,9 @@
 
 # MedClarity
 
-**An agentic, multi-document health research & Q&A assistant**
+**Medical PDFs, minus the detective work.**
 
-Upload your medical reports and ask questions in plain language. MedClarity reads every page of every PDF, cross-references findings across documents, flags contradictions and trends over time, and answers with page-level citations you can click to verify.
+Upload multiple medical documents, ask a question, and get one organized answer with page-level citations, detected conflicts, and a timeline of relevant information.
 
 </div>
 
