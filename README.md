@@ -143,4 +143,4 @@ See [`.env.example`](.env.example) for reference.
 
 ## License
 
-The source is publicly viewable, but no license for reuse is currently granted.
+MIT License — see [LICENSE](LICENSE).
