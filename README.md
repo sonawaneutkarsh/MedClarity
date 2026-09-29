@@ -81,7 +81,7 @@ Optionally, set `GEMINI_API_KEY` in your environment (e.g. a `.env` file — see
 | `npm run dev` | Start the Express + Vite dev server (API proxy + HMR) |
 | `npm run build` | Build the static frontend into `dist/` and bundle the Express server to `dist/server.cjs` |
 | `npm start` | Serve the built app (`dist/`) in production |
-| `npm run lint` | Type-check the codebase (`tsc --noEmit`) |
+| `npm run typecheck` | Type-check the codebase (`tsc --noEmit`) |
 | `npm run clean` | Remove build output |
 
 ---
