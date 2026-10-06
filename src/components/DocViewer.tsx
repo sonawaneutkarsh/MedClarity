@@ -376,7 +376,7 @@ export default function DocViewer({
                   {doc.rawFile ? 'Extracted text' : 'Sample text'} &bull; Page {activePage}
                 </span>
                 <p className="text-xs text-slate-400 leading-normal">
-                  Text extracted from the PDF in your browser. Clicking a citation highlights the matching finding here.
+                  {doc.rawFile ? 'Extracted from the PDF in your browser.' : 'Bundled fictional record; no PDF file behind it.'} Clicking a citation opens its page and highlights the matching finding.
                 </p>
               </div>
 
