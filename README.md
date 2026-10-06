@@ -4,36 +4,62 @@
 
 **Medical PDFs, minus the detective work.**
 
-Upload multiple medical documents, ask a question, and get one organized answer with page-level citations, detected conflicts, and a timeline of relevant information.
+[![CI](https://github.com/sonawaneutkarsh/MedClarity/actions/workflows/ci.yml/badge.svg)](https://github.com/sonawaneutkarsh/MedClarity/actions/workflows/ci.yml)
+
+Upload several medical PDFs, ask a question, and get one answer with page-level citations you can click to check, plus a combined timeline of events across the documents.
+
+[Live demo](https://medclarity-one.vercel.app) · bring your own Gemini API key
 
 </div>
 
+![MedClarity with the two bundled sample records loaded: document list, extracted page text, and suggested questions](docs/screenshots/sample-records.png)
+
+*The bundled sample records (fictional patient) loaded in the live demo. Asking a question needs your own Gemini key.*
+
 ---
 
-## Why MedClarity
+## What it does
 
-Medical records arrive as scattered PDFs — lab results, discharge summaries, follow-up notes — often with overlapping or conflicting information. MedClarity turns that pile of documents into a single, traceable picture:
+- **Citations you can check.** Answers carry inline `[Document Name, p.N]` references. Each one is checked against the documents you loaded: a citation that matches a real document and page becomes a button that opens that page and highlights the finding; one that does not (unknown document, ambiguous name, page out of range) is shown struck through. This makes the evidence inspectable. It does not make the model correct.
+- **Disagreements and trends called out.** The model is asked to flag conflicts between documents (doses, allergies, history) and changes over time. These render as separate callouts above the rest of the answer.
+- **Simple or Detailed answers.** Pick the reading level before you ask, or rewrite an existing answer at the other level.
+- **Combined timeline.** Dated events (findings, treatments, lab results) are extracted per document and merged into one chronological view. If a report date was detected wrong, you can correct it; only events that inherited that date move.
+- **PDFs stay in the browser.** PDF.js extracts text locally. Only the extracted text goes to the server proxy and on to Gemini, with your key.
 
-- **Citations you can actually check** — answers include inline `[Document Name, p.X]` references that jump straight to the source page. This makes the evidence inspectable, although citations do not eliminate every LLM error.
-- **Cross-document conflict detection** — the pipeline explicitly compares findings across reports and surfaces disagreements (different dosages, units, diagnoses) or chronological trends.
-- **Plain or clinical language** — toggle between a warm, layperson-friendly explanation and a precise clinical review of the same findings.
-- **An automatic medical timeline** — key events, treatments, and lab results are extracted and plotted chronologically across all your records.
-- **Your PDFs stay in the browser** — the files are parsed locally with PDF.js. Only the extracted text is sent to the configured Gemini API for analysis.
-
-> **Educational tool, not medical advice.** MedClarity helps you organize and understand your own records. Always discuss findings and treatment decisions with a qualified clinician.
+> **Educational tool, not medical advice.** Discuss findings and treatment decisions with a qualified clinician.
 
 ---
 
 ## How it works
 
-MedClarity does more than throw every document into one giant prompt. For larger document sets, it breaks the question down, finds the relevant evidence, checks for conflicts, and then builds one cited answer. Small document sets use a faster single-shot path.
+Answering a question is **one Gemini request**:
 
-1. **Plan** — the query is split into 2–4 focused clinical sub-questions, each mapped to the documents likely to contain the answer.
-2. **Retrieve & answer** — for each sub-question, the relevant documents are read page-by-page and grounded facts are extracted with the exact source page.
-3. **Audit** — extracted findings are compared across documents to detect contradictions, unit mismatches, and changes over time.
-4. **Synthesize** — everything is merged into a structured report in your chosen reading level, with every claim carrying an inline citation.
+1. PDF.js extracts the text of every page in the browser.
+2. The app sends the question plus the full extracted text of all loaded documents, labelled by document and page, to `/api/gemini`.
+3. The proxy forwards it to Gemini with a JSON response schema. The model returns the answer (Markdown with inline citations), a list of page-level findings, and a short conflict summary.
+4. The browser resolves each citation against the loaded documents and renders the answer. Under each answer, "How this answer was produced" shows the model that answered and how many documents and pages it read.
 
-Supporting features: click any medical term in an answer for a plain-language definition, get suggested follow-up questions based on your records, and inspect the raw pages side-by-side with the timeline.
+Other features make separate, smaller requests: timeline extraction and report-date detection (per uploaded document), suggested questions, the Simple/Detailed rewrite (from the findings already returned, without re-sending the documents), and one-sentence definitions when you select a term in an answer or page.
+
+### Server proxy
+
+`lib/gemini-server.ts` is shared by the Express server (`server.ts`) and the Vercel functions in `api/`:
+
+- Tries models in order: `gemini-3.8-flash`, then `gemini-3.5-flash-lite`, then `gemini-2.5-flash`. Override with `GEMINI_MODELS`.
+- On a rate-limit / quota error, waits for Google's `RetryInfo` delay (capped at 8 s) and retries once, then falls back to the next model.
+- Checks keys with a `models.list` call (no generation quota used).
+- Accepts pasted keys in common forms (`AIzaSy…`, `AQ.…`, `ya29.…`, or a whole `GEMINI_API_KEY="…"` line).
+- Rejects requests over 1,000,000 characters (HTTP 413) and limits each client to 20 Gemini calls and 10 key checks per minute. The limiter is in memory, so on Vercel it applies per function instance.
+
+There is no server-side key. Every request uses the key the user pasted, kept in `sessionStorage` for the browser session.
+
+### Limitations
+
+- All document text goes into one prompt. There is no chunking or retrieval, so very large document sets hit the size limit.
+- No OCR: scanned PDFs without a text layer produce empty pages.
+- Citation checking confirms that the document and page exist. It does not confirm that the page supports the claim.
+- PDF.js is loaded from a CDN.
+- The model list reflects Gemini availability in October 2026. Google limits `gemini-2.5-*` to existing users, so new keys rely on the first two models.
 
 ---
 
@@ -41,36 +67,26 @@ Supporting features: click any medical term in an answer for a plain-language de
 
 | Layer | Technology |
 |---|---|
-| Frontend | React 19, TypeScript, Vite 6, Tailwind CSS 4, Framer Motion, Lucide icons |
-| PDF parsing | PDF.js (browser-side, via CDN) |
-| AI | Google Gemini (`gemini-2.5-flash` with automatic fallback), proxied server-side |
-| Server | Express (dev + self-hosted production), Vercel serverless functions in `api/` |
+| Frontend | React 19, TypeScript (strict), Vite 6, Tailwind CSS 4, react-markdown, Lucide icons |
+| PDF parsing | PDF.js 3.4 in the browser (CDN) |
+| AI | Google Gemini REST API via a server-side proxy |
+| Server | Express (local dev and self-hosting), Vercel serverless functions |
+| Tests / CI | Vitest, GitHub Actions |
 
 ---
 
 ## Getting started
 
-**Prerequisites:** Node.js ≥ 18 and npm.
+**Prerequisites:** Node.js 22.12 or newer (CI uses Node 24) and npm.
 
 ```bash
-# 1. Install dependencies
-npm install
-
-# 2. Start the dev server (Express + Vite)
-npm run dev
+npm ci
+npm run dev        # Express + Vite on http://localhost:3000
 ```
 
-Open the printed URL (default `http://localhost:3000`). The server binds to `0.0.0.0` and honors the `PORT` environment variable.
+Then either click **Load Sample Medical Files** or upload your own PDFs. To ask questions, paste a Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey) into the header; the status dot turns green when Google accepts it.
 
-### Gemini API key
-
-MedClarity works with a **Gemini API key you paste into the app** (top bar), which is verified against the API and used only for your session:
-
-- Create a key at [Google AI Studio](https://aistudio.google.com/apikey) — standard `AIzaSy...` API keys and `AQ....` auth keys are both supported.
-- Paste it into the key field in the app header; a status dot confirms it's valid.
-- No key is required to explore the UI — the app ships a mock/demo mode so you can see the flow without credentials.
-
-Optionally, set `GEMINI_API_KEY` in your environment (e.g. a `.env` file — see `.env.example`) to use as a default; the app never requires a server-side key.
+Without a key you can load the sample records and browse the pages and the timeline, but you cannot ask questions.
 
 ---
 
@@ -78,52 +94,68 @@ Optionally, set `GEMINI_API_KEY` in your environment (e.g. a `.env` file — see
 
 | Script | Description |
 |---|---|
-| `npm run dev` | Start the Express + Vite dev server (API proxy + HMR) |
-| `npm run build` | Build the static frontend into `dist/` and bundle the Express server to `dist/server.cjs` |
-| `npm start` | Serve the built app (`dist/`) in production |
-| `npm run typecheck` | Type-check the codebase (`tsc --noEmit`) |
-| `npm run clean` | Remove build output |
+| `npm run dev` | Express + Vite dev server (API proxy + HMR) |
+| `npm test` | Run the Vitest suite (66 unit tests) |
+| `npm run typecheck` | `tsc --noEmit` |
+| `npm run build` | Build the frontend into `dist/` and bundle the server into `dist/server.cjs` |
+| `npm start` | Serve the production build (`dist/` + `/api`) |
+| `npm run clean` | Remove `dist/` |
+
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `npm ci`, typecheck, tests, and the production build on every push to `main` and every pull request.
+
+### What the tests cover
+
+66 Vitest unit tests, no network access:
+
+- key normalization and placeholder rejection
+- `RetryInfo` delay parsing, rate-limit detection, retry-then-fallback across models, error status mapping
+- request validation (missing prompt, 413 size limit, unknown schema) and key verification
+- answer JSON parsing and the fallback when the model returns plain text
+- citation parsing and resolution against loaded documents and page counts
+- Markdown rendering of answers, including struck-through unresolved citations and escaped HTML
+- the timeline date correction and the per-client rate limiter
 
 ---
 
 ## Project structure
 
 ```
-├── api/                  # Vercel serverless functions (/api/gemini, /api/gemini/verify, /api/key-status)
+├── api/                    # Vercel functions: /api/gemini, /api/gemini/verify
 ├── lib/
-│   └── gemini-server.ts  # Server-side Gemini proxy: model fallback, retries, key verification, mock mode
-├── server.ts             # Express server (dev middleware + static serving + /api routes)
+│   ├── gemini-server.ts    # Gemini proxy: model fallback, retries, validation, key check
+│   └── rate-limit.ts       # In-memory per-client rate limiter
+├── server.ts               # Express server (dev middleware or static dist/ + /api)
 ├── src/
 │   ├── lib/
-│   │   ├── gemini.ts     # Agentic pipeline: plan → retrieve → audit → synthesize
-│   │   └── pdfParser.ts  # Client-side PDF text & page extraction
-│   ├── components/       # DocViewer, TimelineView, SuggestedQuestions, MedicalDictionaryPopup
-│   ├── App.tsx           # Main app shell & chat
-│   └── types.ts          # Shared domain types
-├── index.html
-├── vite.config.ts
-└── vercel.json           # Vercel build/deploy configuration
+│   │   ├── gemini.ts       # Client calls: answer, rewrite, timeline, suggestions, definitions
+│   │   ├── answer.ts       # Pure helpers: answer parsing, citation resolution, date correction
+│   │   └── pdfParser.ts    # PDF.js text extraction, report-date detection
+│   ├── components/         # AnswerView, DocViewer, TimelineView, SuggestedQuestions, MedicalDictionaryPopup
+│   ├── sampleData.ts       # Two fictional sample records
+│   ├── App.tsx             # App shell and chat
+│   └── types.ts
+├── test/                   # Vitest suites
+└── vercel.json
 ```
 
 ---
 
 ## Deployment
 
-### Vercel (recommended)
+### Vercel
 
-The repo includes `vercel.json` and serverless handlers in `api/`, so it deploys as a standard Vite + serverless project:
+`vercel.json` builds with `vite build` and rewrites non-`/api` routes to `index.html`; the functions in `api/` serve the proxy.
 
 ```bash
 npx vercel
 ```
 
-`vercel.json` builds with `vite build` and rewrites SPA routes to `index.html` while leaving `/api/*` to the serverless functions.
-
-### Self-hosted (Node)
+### Self-hosted
 
 ```bash
+npm ci
 npm run build
-npm start        # serves dist/ + /api routes on PORT (default 3000)
+npm start          # serves dist/ and /api on PORT (default 3000)
 ```
 
 ---
@@ -132,15 +164,15 @@ npm start        # serves dist/ + /api routes on PORT (default 3000)
 
 | Variable | Required | Description |
 |---|---|---|
-| `PORT` | No | HTTP port for the server (default `3000`) |
-| `GEMINI_API_KEY` | No | Optional default Gemini key; users can also paste a key in the app UI |
-| `NODE_ENV` | No | `production` serves static files from `dist/`; otherwise Vite dev middleware |
-| `VERCEL` | No | Set automatically on Vercel; skips the Express listener when present |
+| `PORT` | No | HTTP port for `npm run dev` / `npm start` (default `3000`) |
+| `GEMINI_MODELS` | No | Comma-separated models to try in order (default `gemini-3.8-flash,gemini-3.5-flash-lite,gemini-2.5-flash`) |
+| `NODE_ENV` | No | `production` serves `dist/`; anything else uses Vite middleware (`npm start` sets it) |
+| `VERCEL` | No | Set by Vercel; skips the Express listener |
 
-See [`.env.example`](.env.example) for reference.
+There is no Gemini key variable: users paste their own key in the app. See [`.env.example`](.env.example).
 
 ---
 
 ## License
 
-MIT License — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
