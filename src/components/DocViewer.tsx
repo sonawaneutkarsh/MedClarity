@@ -124,7 +124,7 @@ export default function DocViewer({
       if (isCurrent) {
         setCanvasLoading(false);
       }
-    }).catch(err => {
+    }).catch((err: unknown) => {
       console.error("Canvas draw context error", err);
       if (isCurrent) {
         setCanvasError("Canvas rendering failed. Please toggle to Dark-Friendly Reader View.");
@@ -373,10 +373,10 @@ export default function DocViewer({
             <div className="space-y-4">
               <div className="p-4 bg-emerald-50/5 dark:bg-emerald-900/5 border-l-2 border-emerald-500/30 rounded-r-md">
                 <span className="text-[10px] uppercase tracking-wider font-mono text-emerald-600 dark:text-emerald-400 font-semibold block mb-1">
-                  Verified Text Extraction &bull; Page {activePage}
+                  {doc.rawFile ? 'Extracted text' : 'Sample text'} &bull; Page {activePage}
                 </span>
                 <p className="text-xs text-slate-400 leading-normal">
-                  You can copy text from clinical records directly. Key citation highlights are integrated inline.
+                  Text extracted from the PDF in your browser. Clicking a citation highlights the matching finding here.
                 </p>
               </div>
 

@@ -26,20 +26,18 @@ export interface MedicalDocument {
   rawFile?: File; // Used to re-render in the native canvas viewer
 }
 
-export interface AgentStep {
-  id: string;
-  name: string; // e.g., "Planning Approach", "Querying Patient Chart"
-  status: 'pending' | 'running' | 'completed' | 'failed';
-  message: string; // dynamic explanation
-  details?: string; // finer logs
-}
-
-export interface SubAnswer {
-  subQuestion: string;
-  docId: string;
+/** One page-level fact the model reported while answering. */
+export interface SourceFinding {
   docName: string;
   pageNumber: number;
-  answer: string;
+  finding: string;
+}
+
+/** What actually ran to produce an answer, shown under the answer. */
+export interface AnswerProvenance {
+  model: string;
+  documentCount: number;
+  pageCount: number;
 }
 
 export interface ChatMessage {
@@ -47,16 +45,16 @@ export interface ChatMessage {
   sender: 'user' | 'assistant';
   timestamp: string;
   text: string;
-  avatar?: string;
   readingLevel?: 'simple' | 'clinical';
-  agentSteps?: AgentStep[];
   isGenerating?: boolean;
   error?: string;
-  // Raw inputs stored so that toggling simplicity re-runs synthesis without re-running reading
+  /** Non-fatal problem shown under an answer (for example, a failed reading-level rewrite). */
+  notice?: string;
+  provenance?: AnswerProvenance;
+  /** Kept so the reading-level toggle can rewrite the answer without re-reading the documents. */
   rawContext?: {
     originalQuestion: string;
-    plan: { question: string; relevantDocIds: string[] }[];
-    subAnswers: SubAnswer[];
+    findings: SourceFinding[];
     conflicts: string;
   };
 }

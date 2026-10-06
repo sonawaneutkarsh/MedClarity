@@ -1,424 +1,172 @@
-import { MedicalDocument, SubAnswer, TimelineEntry } from '../types';
+import type { MedicalDocument, SourceFinding, TimelineEntry } from '../types';
+import { parseAnswerJson, type ParsedAnswer } from './answer';
 
-export function normalizeGeminiKey(key: string): string {
-  let normalized = (key || "").trim();
-  const assignmentMatch = normalized.match(/^(?:export\s+)?(?:GEMINI_API_KEY|GOOGLE_API_KEY|VITE_GEMINI_API_KEY)\s*=\s*(.+)$/i);
-  if (assignmentMatch?.[1]) {
-    normalized = assignmentMatch[1].trim();
-  }
-
-  normalized = normalized.replace(/[;,]\s*$/, "").trim();
-  if (
-    (normalized.startsWith('"') && normalized.endsWith('"')) ||
-    (normalized.startsWith("'") && normalized.endsWith("'"))
-  ) {
-    normalized = normalized.slice(1, -1).trim();
-  }
-
-  const apiKeyMatch = normalized.match(/AIzaSy[0-9A-Za-z_-]+/);
-  if (apiKeyMatch) {
-    return apiKeyMatch[0];
-  }
-
-  const authKeyMatch = normalized.match(/AQ\.[0-9A-Za-z._-]+/);
-  if (authKeyMatch) {
-    return authKeyMatch[0];
-  }
-
-  const accessTokenMatch = normalized.match(/ya29\.[0-9A-Za-z._-]+/);
-  if (accessTokenMatch) {
-    return accessTokenMatch[0];
-  }
-
-  return normalized;
-}
-
-export function isAuthGeminiKey(key: string): boolean {
-  return normalizeGeminiKey(key).startsWith("AQ.");
-}
+export type ReadingLevel = 'simple' | 'clinical';
 
 export function formatGeminiErrorMessage(rawMessage: string): string {
-  const message = rawMessage || "Unknown Gemini API error.";
-  if (message.includes("429") || message.toLowerCase().includes("quota")) {
-    return "Gemini free-tier quota is exhausted. Your AQ. auth key is valid — wait about a minute and retry, check usage at https://ai.dev/rate-limit, restrict the key to Gemini-only in AI Studio, or enable billing on the linked Google Cloud project.";
+  const message = rawMessage || 'Unknown Gemini API error.';
+  if (message.includes('429') || message.toLowerCase().includes('quota') || message.toLowerCase().includes('resource_exhausted')) {
+    return 'The Gemini quota for this key is exhausted. The key itself is fine: wait about a minute and retry, check usage at https://ai.dev/rate-limit, or enable billing on the linked Google Cloud project.';
   }
   return message;
 }
 
-/**
- * Server-side Gemini proxy caller. Requires the judge's own API key.
- */
+interface CallOptions {
+  isJson?: boolean;
+  responseSchema?: 'answer';
+}
+
+/** Sends one request through the server proxy (/api/gemini) with the user's own key. */
+export async function callGeminiWithModel(
+  apiKey: string,
+  systemInstruction: string,
+  prompt: string,
+  options: CallOptions = {}
+): Promise<{ text: string; model: string }> {
+  const response = await fetch('/api/gemini', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      systemInstruction,
+      prompt,
+      isJson: !!options.isJson,
+      responseSchema: options.responseSchema,
+      customApiKey: apiKey.trim(),
+    }),
+  });
+
+  if (!response.ok) {
+    let errMsg = '';
+    try {
+      const errJson = await response.json();
+      errMsg = errJson.error || JSON.stringify(errJson);
+    } catch {
+      errMsg = `HTTP ${response.status}`;
+    }
+    throw new Error(formatGeminiErrorMessage(errMsg));
+  }
+
+  const result = await response.json();
+  if (!result.text) {
+    throw new Error('The server returned an empty reply.');
+  }
+  return { text: result.text, model: result.model || 'unknown model' };
+}
+
 export async function callGemini(
   apiKey: string,
   systemInstruction: string,
   prompt: string,
   isJson: boolean = false
 ): Promise<string> {
-  const response = await fetch("/api/gemini", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      systemInstruction,
-      prompt,
-      isJson,
-      customApiKey: normalizeGeminiKey(apiKey)
-    })
-  });
-
-  if (!response.ok) {
-    let errMsg = "";
-    try {
-      const errJson = await response.json();
-      errMsg = errJson.error || JSON.stringify(errJson);
-    } catch {
-      errMsg = await response.text();
-    }
-    throw new Error(formatGeminiErrorMessage(errMsg || `HTTP Error ${response.status}`));
-  }
-
-  const result = await response.json();
-  if (!result.text) {
-    throw new Error("Received an empty or malformed reply from the backend.");
-  }
-
-  return result.text;
+  return (await callGeminiWithModel(apiKey, systemInstruction, prompt, { isJson })).text;
 }
 
-/**
- * Fast ping key verification
- */
+/** Asks the server to check the key with Google. */
 export async function testApiKey(apiKey: string): Promise<boolean> {
-  const trimmed = normalizeGeminiKey(apiKey);
+  const trimmed = apiKey.trim();
   if (!trimmed) return false;
-
   try {
-    const response = await fetch("/api/gemini/verify", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ apiKey: trimmed })
+    const response = await fetch('/api/gemini/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apiKey: trimmed }),
     });
     if (!response.ok) return false;
     const result = await response.json();
     return !!result.isValid;
   } catch (err) {
-    console.error("API Key check error", err);
+    console.error('API key check failed', err);
     return false;
   }
 }
 
-/**
- * Step 1: PLAN
- * Returns a list of targeted clinical sub-questions and the relevant document IDs.
- */
-export async function planResearch(
-  apiKey: string,
-  question: string,
-  documents: MedicalDocument[]
-): Promise<{ question: string; relevantDocIds: string[] }[]> {
-  const systemInstruction = `You are the lead clinical developer planning a Multi-document Health Research inquiry. 
-Your goal is to parse a complex user health query and split it into 2 to 4 highly-focused clinical sub-questions. 
-Map each sub-question matching which of the uploaded documents would contain the answer.`;
+const CITATION_RULES = `CITATIONS:
+- Support every factual statement with an inline citation in exactly this form: [Document Name, p.N]
+- "Document Name" must be copied exactly from the DOCUMENT header, and N must be a page number that exists in that document.
+- Never invent documents or pages. If the documents do not answer the question, say so.`;
 
-  const docsSummary = documents
-    .map(d => `Document ID: "${d.id}", Name: "${d.name}", Date: "${d.uploadDate}", Page Count: ${d.pageCount}`)
-    .join("\n");
+const READING_LEVEL_RULES = `READING LEVEL:
+- simple: plain language for a patient, explain medical terms briefly.
+- clinical: precise clinical terminology for a clinician.`;
 
-  const prompt = `
-Original Query: "${question}"
-
-Available Documents:
-${docsSummary}
-
-Determine:
-1. Divide the original query into 2 to 4 distinct simpler sub-questions.
-2. For each sub-question, map the IDs of the documents that contain relevant information. Be precise and conservative.
-
-Return your plan in a strict JSON array where each object has these exact keys: "question" (string) and "relevantDocIds" (array of strings corresponding to document ids).
-Example:
-[
-  { "question": "What was the patient's glucose level?", "relevantDocIds": ["doc-1"] }
-]
-`;
-
-  const text = await callGemini(apiKey, systemInstruction, prompt, true);
-  try {
-    const parsed = JSON.parse(text);
-    if (Array.isArray(parsed)) {
-      return parsed;
-    }
-    if (parsed.subQuestions && Array.isArray(parsed.subQuestions)) {
-      return parsed.subQuestions;
-    }
-    throw new Error("Plan returned unexpected structure");
-  } catch (e) {
-    console.error("Failed to parse Gemini plan, using fallback plan", e);
-    // Fallback: assign question to all files
-    return [
-      {
-        question: `Answer across files: "${question.substring(0, 60)}..."`,
-        relevantDocIds: documents.map(d => d.id)
-      }
-    ];
-  }
+/** Builds the page-labelled document text sent with a question. */
+export function buildDocumentsContext(documents: MedicalDocument[]): string {
+  return documents
+    .map(d => `DOCUMENT: "${d.name}" | Date: ${d.uploadDate} | Pages: ${d.pageCount}\n` +
+      d.pages.map(p => `--- Page ${p.pageNumber} ---\n${p.text}`).join('\n\n'))
+    .join('\n\n==========\n\n');
 }
 
 /**
- * Step 2: RETRIEVE & ANSWER PER DOCUMENT/PAGE
- * Send document text and the specific sub-question to Gemini.
+ * Answers a question with ONE Gemini request that receives the full extracted text
+ * of every loaded document and returns structured JSON (answer, page-level findings,
+ * and a short conflict summary).
  */
-export async function retrieveAndAnswer(
-  apiKey: string,
-  subQuestion: string,
-  doc: MedicalDocument
-): Promise<SubAnswer[]> {
-  // We can group document contents by pages and prompt the model to review.
-  // Since we want page-level citations, we formulate the pages nicely with page tags.
-  const pagesText = doc.pages
-    .map(p => `[BEGIN_PAGE_${p.pageNumber}]\n${p.text}\n[END_PAGE_${p.pageNumber}]`)
-    .join("\n\n");
-
-  const systemInstruction = `You are an expert clinical investigator extracting structured facts from patient files. 
-You answer with ultimate truthfulness, relying ONLY on the text provided. 
-If the text does not supply the answers, explicitly report "NOT_FOUND". Ensure citations are grounded.`;
-
-  const prompt = `
-Sub-Question to Solve: "${subQuestion}"
-Document Name: "${doc.name}"
-Document Date: "${doc.uploadDate}"
-
-TEXT CONTENT FOR THIS DOCUMENT:
-${pagesText}
-
-Based ONLY on the text content above, formulate a short, fact-based response answering the sub-question.
-Additionally, detect the EXACT page number where the evidence resides.
-If the document does not contain the answer or is completely irrelevant, return "NOT_FOUND: This document does not address this sub-question." inside the "answer" field.
-
-Return your response in strict JSON format with these exact keys:
-{
-  "answer": "Grounded medical answer summary, or NOT_FOUND statement",
-  "pageNumber": 1
-}
-(If there are multiple pages, return the primary page number).
-`;
-
-  const text = await callGemini(apiKey, systemInstruction, prompt, true);
-  try {
-    const parsed = JSON.parse(text);
-    const ans = parsed.answer || "";
-    if (ans.toUpperCase().includes("NOT_FOUND")) {
-      return [];
-    }
-    return [
-      {
-        subQuestion,
-        docId: doc.id,
-        docName: doc.name,
-        pageNumber: typeof parsed.pageNumber === 'number' ? parsed.pageNumber : 1,
-        answer: ans
-      }
-    ];
-  } catch (e) {
-    console.error(`Failed to parse page analysis for document ${doc.name}`, e);
-    // Return simple fallback citation
-    return [
-      {
-        subQuestion,
-        docId: doc.id,
-        docName: doc.name,
-        pageNumber: 1,
-        answer: text.substring(0, 300)
-      }
-    ];
-  }
-}
-
-/**
- * Step 3: DETECT CONFLICTS
- * Checks if multiple document findings are in agreement, contradict, or show trend over time.
- */
-export async function detectConflicts(
-  apiKey: string,
-  subAnswers: SubAnswer[],
-  documents: MedicalDocument[]
-): Promise<string> {
-  if (subAnswers.length < 2) {
-    return "No comparisons necessary. Single source fact analyzed.";
-  }
-
-  const systemInstruction = `You are a clinical data safety officer and timeline auditor. 
-Compare multiple independent extractions for the same subjects.
-Detect discrepancies, contradictions, and changes over time based on report dates.`;
-
-  const answersReport = subAnswers
-    .map(
-      (sa, i) =>
-        `No. ${i + 1}:
-Sub-Question investigated: "${sa.subQuestion}"
-Document Source: "${sa.docName}" (Page ${sa.pageNumber})
-Finding: "${sa.answer}"`
-    )
-    .join("\n\n");
-
-  const docsTimeline = documents
-    .map(d => `- "${d.name}" (Report Date: ${d.uploadDate})`)
-    .join("\n");
-
-  const prompt = `
-Analyze the medical findings below drawn from different documents.
-Document Reports Timeline:
-${docsTimeline}
-
-Extracted Findings:
-${answersReport}
-
-Examine:
-1. AGREEMENT vs. CONTRADICTION: Are there different diagnosis, vital values, or medication dosages?
-2. TIMELINE SHIFT: Does the report dates explain the change? (e.g., Blood pressure was high on Day 1, but normal on Day 10 after starting medicine).
-3. UNITS / METRICS: Are there conflicts in units (e.g. mg vs mcg)?
-
-Answer with a short clinical report:
-Start with high-contrast alert tags if contradictions exist, e.g. [CONTRADICTION DETECTED] or [CHRONOLOGICAL TREND DETECTED].
-Keep your comparison concise and clinically grounded.
-`;
-
-  return await callGemini(apiKey, systemInstruction, prompt, false);
-}
-
-/**
- * Step 4: SYNTHESIZE ANSWER
- * Combine all sub-answers, plan, and conflicts into a final integrated report.
- */
-export async function synthesizeAnswer(
-  apiKey: string,
-  originalQuestion: string,
-  plan: { question: string; relevantDocIds: string[] }[],
-  subAnswers: SubAnswer[],
-  conflicts: string,
-  readingLevel: 'simple' | 'clinical'
-): Promise<string> {
-  const isClinical = readingLevel === 'clinical';
-
-  const systemInstruction = `You are the lead Chief Medical Officer of MedClarity producing a synchronized consultation output.
-Synthesize the structured findings derived from various clinical pages into a unified cohesive report answering: "${originalQuestion}"
-
-CITATION COMPLIANCE RULES:
-- You MUST back up statements with inline clickable citations using exactly the format: "[DocName, p.X]".
-- "DocName" must match the original document name EXACTLY, and X must be the page number.
-- Example: "The patient showed normal kidney clearance [Lab Report 1, p.2]."
-- Never invent citations. Only use the authentic docNames and pageNumbers provided.
-- Do not use markdown hyperlinks like [DocName](p1); use literal square brackets \`[Document Name, p.X]\`.
-
-READING LEVEL FORMATS:
-- For 'simple' style: Speak directly, with warmth, explaining complex words, using layperson terms, very understandable.
-- For 'clinical' style: Use advanced, precise clinical terminology, professional medical structure, detailed pathophysiological breakdowns.`;
-
-  const findingsTrail = subAnswers
-    .map(
-      sa =>
-        `- For "${sa.subQuestion}" in Document "${sa.docName}" Page ${sa.pageNumber}:
-  Finding: "${sa.answer}"`
-    )
-    .join("\n");
-
-  const prompt = `
-User Query: "${originalQuestion}"
-
-We gathered these grounded facts from independent pages:
-${findingsTrail}
-
-Timeline, Agreement & Conflict Audit Report:
-${conflicts}
-
-Format the Synthesis Report under the ${readingLevel.toUpperCase()} level.
-1. If there's a trend over time or a conflict between documents, state it explicitly and clearly in a high-visibility callout box or blockquote near the very top (e.g., "[TREND IDENTIFIED]" or "[ALERT: CONTRADICTION DETECTED]").
-2. Write a highly structured review, ending with a clear, concise final recommendation.
-3. Every single fact MUST carry its inline citation bracket \`[Document Name, p.PageNumber]\` exactly matching the source.
-`;
-
-  return await callGemini(apiKey, systemInstruction, prompt, false);
-}
-
-/**
- * Single-shot: answer directly from all documents in one Gemini call.
- * Used when total pages are small to avoid the multi-step pipeline overhead.
- */
-export async function answerSingleShot(
+export async function answerQuestion(
   apiKey: string,
   question: string,
   documents: MedicalDocument[],
-  readingLevel: 'simple' | 'clinical'
-): Promise<{
-  finalAnswer: string;
-  plan: { question: string; relevantDocIds: string[] }[];
-  subAnswers: SubAnswer[];
-  conflicts: string;
-}> {
-  const docsText = documents
-    .map(
-      d =>
-        `DOCUMENT: "${d.name}" | Date: ${d.uploadDate} | Pages: ${d.pageCount}
-${d.pages.map(p => `--- Page ${p.pageNumber} ---\n${p.text}`).join("\n\n")}`
-    )
-    .join("\n\n==========\n\n");
+  readingLevel: ReadingLevel
+): Promise<ParsedAnswer & { model: string }> {
+  const systemInstruction = `You help a patient understand their own medical records. Answer using ONLY the provided documents.
 
-  const systemInstruction = `You are the lead Chief Medical Officer of MedClarity. Answer a patient question using ONLY the provided documents.
+${CITATION_RULES}
 
-CITATION COMPLIANCE RULES:
-- You MUST back up statements with inline clickable citations using exactly the format: "[DocName, p.X]".
-- "DocName" must match the original document name EXACTLY, and X must be the page number.
-- Never invent citations. Only use the authentic docNames and pageNumbers provided.
+${READING_LEVEL_RULES}
 
-READING LEVEL FORMATS:
-- For 'simple' style: Speak directly, with warmth, explaining complex words, using layperson terms.
-- For 'clinical' style: Use advanced, precise clinical terminology, professional medical structure.
+OUTPUT: strict JSON with these keys:
+- "finalAnswer": the answer in Markdown (short headings and bullet lists are fine). If documents disagree, or a value changes over time, start that paragraph with [CONTRADICTION DETECTED] or [TREND IDENTIFIED].
+- "findings": array of { "docName", "pageNumber", "finding" }, one entry per page-level fact you used, with "finding" quoting or closely paraphrasing the page.
+- "conflicts": one or two sentences on disagreements between documents, or "No discrepancies reported."`;
 
-Return strict JSON with these exact keys:
-- "plan": array of { "question": string, "relevantDocIds": string[] }
-- "subAnswers": array of { "subQuestion": string, "docId": string, "docName": string, "pageNumber": number, "answer": string }
-- "conflicts": string (timeline audit findings, or "No discrepancies detected.")
-- "finalAnswer": string (the complete answer to the user question)`;
+  const prompt = `Question: "${question}"
+Reading level: ${readingLevel}
 
-  const prompt = `
-User Question: "${question}"
+${buildDocumentsContext(documents)}`;
 
-Available Documents:
-${docsText}
-
-Format the Synthesis Report under the ${readingLevel.toUpperCase()} level.
-1. If there's a trend over time or a conflict between documents, state it explicitly near the top.
-2. Write a highly structured review, ending with clear recommendations.
-3. Every single fact MUST carry its inline citation bracket \`[Document Name, p.PageNumber]\`.
-
-Return ONLY valid JSON with keys: "plan", "subAnswers", "conflicts", "finalAnswer".
-`;
-
-  const text = await callGemini(apiKey, systemInstruction, prompt, true);
-  try {
-    const parsed = JSON.parse(text);
-    return {
-      finalAnswer: parsed.finalAnswer || parsed.answer || parsed.report || "No answer generated.",
-      plan: Array.isArray(parsed.plan) ? parsed.plan : [],
-      subAnswers: Array.isArray(parsed.subAnswers) ? parsed.subAnswers : [],
-      conflicts: parsed.conflicts || "No discrepancies detected."
-    };
-  } catch (e) {
-    console.error("Single-shot parse failed, returning raw text", e);
-    return {
-      finalAnswer: text,
-      plan: [],
-      subAnswers: [],
-      conflicts: "No discrepancies detected."
-    };
-  }
+  const { text, model } = await callGeminiWithModel(apiKey, systemInstruction, prompt, {
+    isJson: true,
+    responseSchema: 'answer',
+  });
+  return { ...parseAnswerJson(text), model };
 }
 
 /**
- * UTILITY: Extract timeline data from parsed PDF page contents
+ * Rewrites an existing answer at another reading level from the findings the first
+ * request already returned (one more request; the documents are not re-sent).
  */
+export async function rewriteAnswer(
+  apiKey: string,
+  question: string,
+  findings: SourceFinding[],
+  conflicts: string,
+  readingLevel: ReadingLevel
+): Promise<{ text: string; model: string }> {
+  const systemInstruction = `You rewrite an answer about a patient's medical records at a requested reading level, using ONLY the findings provided.
+
+${CITATION_RULES}
+
+${READING_LEVEL_RULES}
+
+Answer in Markdown. If findings disagree or change over time, start that paragraph with [CONTRADICTION DETECTED] or [TREND IDENTIFIED].`;
+
+  const findingsText = findings.length
+    ? findings.map(f => `- [${f.docName}, p.${f.pageNumber}] ${f.finding}`).join('\n')
+    : '- (no page-level findings were returned)';
+
+  const prompt = `Question: "${question}"
+Reading level: ${readingLevel}
+
+Findings:
+${findingsText}
+
+Conflict summary: ${conflicts}`;
+
+  return callGeminiWithModel(apiKey, systemInstruction, prompt);
+}
+
+/** Extracts up to 6 dated events from one document for the combined timeline. */
 export async function extractTimelineEntries(
   apiKey: string,
   docId: string,
@@ -426,145 +174,79 @@ export async function extractTimelineEntries(
   docDate: string,
   pages: { pageNumber: number; text: string }[]
 ): Promise<TimelineEntry[]> {
-  const fullTextSample = pages.map(p => `(Page ${p.pageNumber}): ${p.text}`).join("\n").substring(0, 16000);
+  const fullTextSample = pages.map(p => `(Page ${p.pageNumber}): ${p.text}`).join('\n').substring(0, 16000);
 
-  const systemInstruction = `You are a clinical historical archivist. Extract dates, findings, medications, or events with high timing-accuracy.`;
+  const systemInstruction = 'Extract dated clinical events (findings, treatments, lab results) from a medical document. Use only dates written in or clearly implied by the text.';
 
-  const prompt = `
-Extract up to 6 key clinical occurrences from this document.
+  const prompt = `Extract up to 6 key clinical events from this document.
 Document Name: "${docName}"
-Primary Document Date: "${docDate}"
+Document Date: "${docDate}"
 
 DOCUMENT CONTENT:
 ${fullTextSample}
 
-Extract and structure each event in a JSON array. Each object in the array MUST contain:
-1. "date": The specific date as written or implied (e.g., "June 15, 2026").
-2. "isoDate": Standardized "YYYY-MM-DD" style date. If only the year or month is known, approximate (e.g., "June 2026" -> "2026-06-15"). This is used for sorting.
-3. "event": Clear, concise clinical sentence of what happened (e.g., "Prescribed Amoxicillin 500mg").
-4. "pageNumber": Page number.
-5. "type": Must be one of these categories: 'clinical_finding', 'treatment', 'lab_result', 'general'.
-
-Return your answer strictly in JSON layout:
-{
-  "events": [
-    {
-      "date": "Date text",
-      "isoDate": "YYYY-MM-DD",
-      "event": "Finding details",
-      "pageNumber": 1,
-      "type": "clinical_finding"
-    }
-  ]
-}
-`;
+Return JSON: { "events": [ { "date": "date as written", "isoDate": "YYYY-MM-DD (approximate the day if only month/year is known)", "event": "one short sentence", "pageNumber": 1, "type": "clinical_finding" | "treatment" | "lab_result" | "general" } ] }`;
 
   try {
     const text = await callGemini(apiKey, systemInstruction, prompt, true);
     const parsed = JSON.parse(text);
-    const rawEvents = parsed.events || [];
-    return rawEvents.map((ev: any) => {
-      // Parse isoDate for epoch sorting
-      let epoch = Date.now();
-      if (ev.isoDate) {
-        const parsedD = Date.parse(ev.isoDate);
-        if (!isNaN(parsedD)) {
-          epoch = parsedD;
-        }
-      }
+    const rawEvents: any[] = Array.isArray(parsed?.events) ? parsed.events : [];
+    return rawEvents.map(ev => {
+      const parsedEpoch = ev.isoDate ? Date.parse(ev.isoDate) : NaN;
       return {
         date: ev.date || docDate,
-        event: ev.event || "",
+        isoDate: typeof ev.isoDate === 'string' ? ev.isoDate : undefined,
+        event: ev.event || '',
         sourceDocId: docId,
         sourceDocName: docName,
         pageNumber: typeof ev.pageNumber === 'number' ? ev.pageNumber : 1,
-        type: ev.type || 'general',
-        epochTime: epoch
-      };
+        type: ['clinical_finding', 'treatment', 'lab_result', 'general'].includes(ev.type) ? ev.type : 'general',
+        epochTime: Number.isNaN(parsedEpoch) ? Date.parse(docDate) : parsedEpoch,
+      } as TimelineEntry;
     });
   } catch (e) {
-    console.error("Failed to parse timeline for PDF", e);
+    console.error('Timeline extraction failed for', docName, e);
     return [];
   }
 }
 
-/**
- * UTILITY: Generate 3-4 suggested expert health inquiries based on files
- */
-export async function generateSuggestedInquiries(
-  apiKey: string,
-  documents: MedicalDocument[]
-): Promise<string[]> {
-  const systemInstruction = `You are a medical record guide. Generate 3 or 4 extremely short, punchy questions. Each question MUST be under 10 words, phrased as a simple, natural layperson query (e.g., "Has blood pressure improved?" or "Are medications different?"). Do NOT exceed 10 words per question.`;
+/** Suggests 3-4 short questions about the loaded documents. */
+export async function generateSuggestedInquiries(apiKey: string, documents: MedicalDocument[]): Promise<string[]> {
+  const systemInstruction = 'Suggest 3 or 4 short, plain-language questions (under 10 words each) a patient could ask about their records.';
+  const prompt = `Records:
+${documents.map(d => `- "${d.name}" (${d.uploadDate}, ${d.pageCount} pages)`).join('\n')}
 
-  const docSummaries = documents
-    .map(d => `- "${d.name}" (${d.uploadDate}, ${d.pageCount} pages)`)
-    .join("\n");
+Return JSON: { "questions": ["...", "..."] }`;
 
-  const prompt = `
-We have academic or clinical medical records uploaded:
-${docSummaries}
-
-Generate 3 or 4 simple, high-utility comparison questions about these records.
-Each question MUST be under 10 words. Do not use jargon. Style them like simple patient lookups.
-
-Return strictly in this JSON format:
-{
-  "questions": [
-    "Short question 1?",
-    "Short question 2?",
-    "Short question 3?"
-  ]
-}
-`;
-
+  const fallback = [
+    'Are there any discrepancies between reports?',
+    'How did lab values change over time?',
+    'Are there medication differences?',
+  ];
   try {
-    const text = await callGemini(apiKey, systemInstruction, prompt, true);
-    const parsed = JSON.parse(text);
-    if (parsed.questions && Array.isArray(parsed.questions)) {
+    const parsed = JSON.parse(await callGemini(apiKey, systemInstruction, prompt, true));
+    if (Array.isArray(parsed?.questions) && parsed.questions.length > 0) {
       return parsed.questions.map((q: string) => {
-        const words = q.split(/\s+/);
-        if (words.length > 10) {
-          return words.slice(0, 9).join(' ') + '?';
-        }
-        return q;
+        const words = String(q).split(/\s+/);
+        return words.length > 10 ? words.slice(0, 9).join(' ') + '?' : String(q);
       });
     }
-    return [
-      "Are there any report discrepancies?",
-      "How did vitals change over time?",
-      "Are there medication disagreements?"
-    ];
-  } catch (e) {
-    return [
-      "What are the major diagnoses?",
-      "Compare lab outcomes chronologically.",
-      "Are there conflicting prescriptions?"
-    ];
+    return fallback;
+  } catch {
+    return fallback;
   }
 }
 
-/**
- * UTILITY: Quick medical lookup definition
- */
-export async function lookupMedicalDefinition(
-  apiKey: string,
-  term: string,
-  paragraphContext: string
-): Promise<string> {
-  const systemInstruction = `You are a patient-friendly medical dictionary. Translate complex medical terms into a single, plain-language sentence.`;
+/** One-sentence plain-language definition of a selected term. */
+export async function lookupMedicalDefinition(apiKey: string, term: string, paragraphContext: string): Promise<string> {
+  const systemInstruction = 'Explain a medical term in one plain-language sentence.';
+  const prompt = `Term: "${term}"
+Context: "...${paragraphContext.substring(0, 300)}..."
 
-  const prompt = `
-Term to define: "${term}"
-Context of use: "...${paragraphContext.substring(0, 300)}..."
-
-Explain what "${term}" means in a warm, simple, accurate, and supportive way that a normal layperson can understand instantly. Keep it strictly to one sentence.
-Do not use terms like "as mentioned in the context". Just define the word itself.
-`;
-
+Define "${term}" in one short sentence a non-specialist understands. Define the word itself; do not refer to the context.`;
   try {
     return await callGemini(apiKey, systemInstruction, prompt, false);
-  } catch (err) {
-    return "Definition lookup unavailable. Please consult your physician.";
+  } catch {
+    return 'Definition lookup is unavailable right now.';
   }
 }

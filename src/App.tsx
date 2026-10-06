@@ -2,18 +2,20 @@ import { useState, useEffect, useRef, useMemo, DragEvent, ChangeEvent, FormEvent
 import { parsePdfFile, extractClinicalReportDate } from './lib/pdfParser';
 import {
   testApiKey,
-  synthesizeAnswer,
-  answerSingleShot,
+  answerQuestion,
+  rewriteAnswer,
   generateSuggestedInquiries,
   extractTimelineEntries
 } from './lib/gemini';
-import { MedicalDocument, ChatMessage, TimelineEntry, AgentStep, SubAnswer } from './types';
+import { applyDocDateCorrection, countPages, resolveCitation, type CitationToken } from './lib/answer';
+import { SAMPLE_DOCUMENTS, SAMPLE_QUESTIONS } from './sampleData';
+import { MedicalDocument, ChatMessage, TimelineEntry } from './types';
 import DocViewer from './components/DocViewer';
 import TimelineView from './components/TimelineView';
 import SuggestedQuestions from './components/SuggestedQuestions';
 import MedicalDictionaryPopup from './components/MedicalDictionaryPopup';
-import { motion, AnimatePresence } from 'motion/react';
-import { Activity, Plus, Trash2, Trash, Circle as HelpCircle, Loader as Loader2, Send, Sparkles, ShieldCheck, CircleAlert as AlertCircle, Calendar, BookOpen, BrainCircuit, Key, Sun, Moon, FileText, History, Clock, RefreshCw, Info } from 'lucide-react';
+import AnswerView from './components/AnswerView';
+import { Activity, Plus, Trash2, Trash, Loader as Loader2, Send, Sparkles, CircleAlert as AlertCircle, BrainCircuit, Key, Sun, Moon, FileText, History, RefreshCw, Info } from 'lucide-react';
 
 export default function App() {
   // Theme state
@@ -73,7 +75,7 @@ export default function App() {
     }
   }, [isDarkMode]);
 
-  // Restore a key only if the judge entered one earlier in this browser session.
+  // Restore a key only if the user entered one earlier in this browser session.
   useEffect(() => {
     const savedKey = sessionStorage.getItem('medclarity_session_key');
     if (savedKey) {
@@ -262,35 +264,18 @@ export default function App() {
     }
   }, [keyState]);
 
-  // Manual update doc date from the center panel
-  const handleUpdateDocDate = async (docId: string, newDate: string) => {
-    // Basic format validator
-    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
-    if (!dateRegex.test(newDate)) {
-      alert("Please ensure the date follows standard YYYY-MM-DD format.");
-      return;
-    }
-
-    setDocuments(prev => prev.map(doc => {
-      if (doc.id === docId) {
-        // Re-calculate the timeline event epochs under the new sorted date
-        const timeline = doc.timelineEntries?.map(entry => {
-          const parsedEpoch = Date.parse(newDate);
-          return {
-            ...entry,
-            date: newDate,
-            epochTime: isNaN(parsedEpoch) ? Date.now() : parsedEpoch
-          };
-        }) || [];
-
-        return {
+  // Manual correction of a document's report date from the center panel.
+  // Only timeline events that inherited the old document date move with it.
+  const handleUpdateDocDate = (docId: string, newDate: string) => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(newDate)) return;
+    setDocuments(prev => prev.map(doc => doc.id === docId
+      ? {
           ...doc,
           uploadDate: newDate,
-          timelineEntries: timeline
-        };
-      }
-      return doc;
-    }));
+          timelineEntries: applyDocDateCorrection(doc.timelineEntries || [], doc.uploadDate, newDate)
+        }
+      : doc
+    ));
   };
 
   // Remove document from rail safely
@@ -310,157 +295,16 @@ export default function App() {
     });
   };
 
-  // Pre-load a Mock Patient Record set to let clinicians preview immediately
+  // Load the bundled fictional sample records (no upload or key needed to browse them)
   const handleLoadSampleRecords = () => {
-    const sampleDocs: MedicalDocument[] = [
-      {
-        id: 'sample-doc-1',
-        name: 'Apex_Cardiology_Summary_Doe_John.pdf',
-        uploadDate: '2026-03-12',
-        pageCount: 3,
-        sizeString: '420 KB',
-        pages: [
-          {
-            pageNumber: 1,
-            text: `PATIENT DEMOGRAPHICS & CLINICAL METRICS
-Name: John Doe | DOB: 1978-08-14 | Gender: Male
-Encounter Date: March 12, 2026 | Provider: Dr. Sarah Vance, MD
-
-REASON FOR ENCOUNTER:
-Follow-up for primary cardiac profile evaluation, chronic hypertension, chest discomfort, and hyperlipidemia management.
-
-VITAL SIGNS:
-Height: 180 cm | Weight: 92 kg | BMI: 28.4 (Overweight)
-Blood Pressure: 145/92 mmHg (Elevated) | Heart Rate: 72 bpm | SpO2: 98% on room air
-
-ALLERGIC DISPOSITION & SOCIAL HISTORY:
-- Drug Allergies: Severe allergy to Penicillin (Anaphylaxis in 2018).
-- Smoking: Denies any lifetime tobacco or smoking history (never smoked).
-
-ECG FINDINGS:
-Sinus rhythm at 74 bpm. Prominent voltage criteria in lead V5 and V6 indicating early forms of Left Ventricular Hypertrophy (LVH). No ST-segment elevations or active T-wave inversions observed.`
-          },
-          {
-            pageNumber: 2,
-            text: `Apex Cardiology Clinic - Doe, John - Page 2
-
-BASELINE lipid PROFILE LABS (Done March 10, 2026):
-- Total Cholesterol: 240 mg/dL (Severely elevated)
-- Triglycerides: 210 mg/dL (Elevated)
-- LDL Cholesterol: 155 mg/dL (High risk target range)
-- HDL Cholesterol: 42 mg/dL (Sub-optimal level)
-
-RECOMMENDATIONS & PHARMACOLOGICAL MANAGEMENT:
-The elevated arterial blood pressures, abnormal lipid panel, and hypertensive ventricular changes require dual agent therapy:
-1. Initiate Atorvastatin 40 mg PO nightly (titrated up from 10 mg) to combat hyperlipidemia.
-2. Initiate Amlodipine 5 mg PO daily for blood pressure control.
-3. Patient directed to restrict dietary sodium intake (~1500 mg daily limit).`
-          },
-          {
-            pageNumber: 3,
-            text: `Apex Cardiology Clinic - Doe, John - Page 3
-
-DIAGNOSTIC CRITERIA & CONCLUSION:
-Primary assessments correspond to Essential Arterial Hypertension combined with Hyperlipidemia.
-Follow up scheduled in 90 days (June 2026) to audit blood lipid profile panel and test kidney creatinine clearance.`
-          }
-        ],
-        timelineEntries: [
-          {
-            date: '2026-03-12',
-            isoDate: '2026-03-12',
-            event: 'Diagnosed with early Left Ventricular Hypertrophy (LVH) via ECG findings',
-            sourceDocId: 'sample-doc-1',
-            sourceDocName: 'Apex_Cardiology_Summary_Doe_John.pdf',
-            pageNumber: 1,
-            type: 'clinical_finding',
-            epochTime: Date.parse('2026-03-12')
-          },
-          {
-            date: '2026-03-12',
-            isoDate: '2026-03-12',
-            event: 'Initiated Atorvastatin 40mg nightly and Amlodipine 5mg daily',
-            sourceDocId: 'sample-doc-1',
-            sourceDocName: 'Apex_Cardiology_Summary_Doe_John.pdf',
-            pageNumber: 2,
-            type: 'treatment',
-            epochTime: Date.parse('2026-03-12')
-          }
-        ]
-      },
-      {
-        id: 'sample-doc-2',
-        name: 'Apex_Cardiology_90_Day_Lipid_Panel_Doe.pdf',
-        uploadDate: '2026-06-10',
-        pageCount: 2,
-        sizeString: '250 KB',
-        pages: [
-          {
-            pageNumber: 1,
-            text: `APEX CARDIOLOGY CLINICAL REASSESSMENT
-Patient: John Doe | Diagnostic Re-evaluation Date: June 10, 2026
-Attendant Phys: Dr. Sarah Vance, MD
-
-FOLLOW-UP REVIEW:
-Patient returns for 90-day progress panel. Reports high medication adherence. Denies any drug allergies (states "No Known Drug Allergies - NKDA").
-Dr. Vance prescribed amoxicillin/clavulanate (Penicillin family resistance) today for mild bronchitis.
-Patient reports smoking half a pack of cigarettes daily for the last 15 years, seeking tobacco cessation counseling.
-
-VITAL PROGRESSION:
-Blood Pressure: 128/80 mmHg (Normal control - indicating strong responsiveness to Amlodipine 5 mg daily).
-Weight recorded at 89.5 kg (Loss of 2.5 kg).`
-          },
-          {
-            pageNumber: 2,
-            text: `Apex Cardiology Clinic - 90-Day Lipid Panel - Page 2
-
-BLOOD LIPID PROFILE COMPARISON:
-- Total Cholesterol: 165 mg/dL (Successful decline from March 2026 baseline of 240 mg/dL)
-- Triglycerides: 135 mg/dL (Normal control, decline from March 2026 baseline of 210 mg/dL)
-- LDL Cholesterol: 88 mg/dL (Outstanding result, successfully meeting the cardiological target of <100 mg/dL, decline from March 2026 baseline of 155 mg/dL on Atorvastatin)
-- HDL Cholesterol: 50 mg/dL (Cardio-protective state, improvement from 42 mg/dL)
-
-CLINICAL DECISION TRAIL & DISCREPANCY:
-Patient notes he is taking his "Atorvastatin 10 mg daily" (Note: March recommendations were Atorvastatin 40 mg nightly).
-Continue Amlodipine 5 mg PO daily. Continue Atorvastatin 40 mg PO nightly. Next baseline metabolic panels scheduled for December 2026.`
-          }
-        ],
-        timelineEntries: [
-          {
-            date: '2026-06-10',
-            isoDate: '2026-06-10',
-            event: 'Blood Pressure successfully controlled to 128/80 mmHg using daily Amlodipine',
-            sourceDocId: 'sample-doc-2',
-            sourceDocName: 'Apex_Cardiology_90_Day_Lipid_Panel_Doe.pdf',
-            pageNumber: 1,
-            type: 'clinical_finding',
-            epochTime: Date.parse('2026-06-10')
-          },
-          {
-            date: '2026-06-10',
-            isoDate: '2026-06-10',
-            event: 'Serum Blood Test confirms LDL Cholesterol reduced from high levels to 88 mg/dL',
-            sourceDocId: 'sample-doc-2',
-            sourceDocName: 'Apex_Cardiology_90_Day_Lipid_Panel_Doe.pdf',
-            pageNumber: 2,
-            type: 'lab_result',
-            epochTime: Date.parse('2026-06-10')
-          }
-        ]
-      }
-    ];
+    const sampleDocs = SAMPLE_DOCUMENTS;
 
     setDocuments(sampleDocs);
     setSelectedDocId(sampleDocs[0].id);
     setActivePage(1);
 
     // Auto populate custom suggested research questions as a guide
-    setSuggestedQuestionsList([
-      "Compare the patient's lipids and cholesterol over the 90-day treatment timeline.",
-      "Has John Doe's Blood Pressure successfully responded to his clinical therapies over time?",
-      "Detail John Doe's active prescriptions and general treatment directives.",
-      "Are there any clinical contradictions or dosage irregularities identified across these assessments?"
-    ]);
+    setSuggestedQuestionsList(SAMPLE_QUESTIONS);
   };
 
   // Clear all uploaded documents safely
@@ -477,56 +321,27 @@ Continue Amlodipine 5 mg PO daily. Continue Atorvastatin 40 mg PO nightly. Next 
     handleSubmitQuestion(null, question);
   };
 
-  // Help normalize document titles for loose references comparison
-  const normalizeDocName = (name: string) => {
-    return name
-      .toLowerCase()
-      .replace(/\.pdf$/gi, '')
-      .replace(/[^a-z0-9]/gi, '');
-  };
+  // Citation click: the citation was already resolved against the loaded documents.
+  const handleCitationJump = (docId: string, pageNumber: number, _citation: CitationToken) => {
+    setSelectedDocId(docId);
+    setActivePage(pageNumber);
+    setCenterPanelMode('viewer');
 
-  // Dynamic citation jump handler
-  const handleCitationJump = (docName: string, pageNumber: number) => {
-    const targetNormalized = normalizeDocName(docName);
-
-    // Find doc ID with robust fuzzy normalization
-    const foundDoc = documents.find(d => {
-      const currentNormalized = normalizeDocName(d.name);
-      return currentNormalized.includes(targetNormalized) || targetNormalized.includes(currentNormalized);
-    });
-
-    if (foundDoc) {
-      setSelectedDocId(foundDoc.id);
-      setActivePage(pageNumber);
-      setCenterPanelMode('viewer');
-
-      // Look up previous chat transcripts to extract the precise statement returned by the model
-      let highlightSnippet = '';
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const msg = messages[i];
-        if (msg.sender === 'assistant' && msg.rawContext?.subAnswers) {
-          const match = msg.rawContext.subAnswers.find(sa => {
-            const entryNormalized = normalizeDocName(sa.docName);
-            return (entryNormalized.includes(targetNormalized) || targetNormalized.includes(entryNormalized))
-              && sa.pageNumber === pageNumber;
-          });
-          if (match && match.answer) {
-            highlightSnippet = match.answer;
-            break;
-          }
-        }
-      }
-
-      // Fallback to active query key terms if no direct sentence extraction matches
-      setActiveHighlightSnippet(highlightSnippet);
-
-      setTimeout(() => {
-        const item = document.getElementById(`doc-viewer-${foundDoc.id}`);
-        if (item) {
-          item.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        }
-      }, 100);
+    // Highlight the finding the model reported for this page, if it returned one.
+    let highlightSnippet = '';
+    for (let i = messages.length - 1; i >= 0 && !highlightSnippet; i--) {
+      const findings = messages[i].rawContext?.findings || [];
+      const match = findings.find(f => {
+        const r = resolveCitation(f.docName, f.pageNumber, documents);
+        return r.ok && r.docId === docId && r.pageNumber === pageNumber;
+      });
+      if (match) highlightSnippet = match.finding;
     }
+    setActiveHighlightSnippet(highlightSnippet);
+
+    setTimeout(() => {
+      document.getElementById(`doc-viewer-${docId}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 100);
   };
 
   // Text highlighting gloss lookup triggers
@@ -554,60 +369,30 @@ Continue Amlodipine 5 mg PO daily. Continue Atorvastatin 40 mg PO nightly. Next 
     }
   };
 
-  // Submit Q&A
+  const nowLabel = () => new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+  // Submit Q&A: one Gemini request over all loaded documents.
   const handleSubmitQuestion = async (e: FormEvent | null, forceQuestion?: string) => {
     if (e) e.preventDefault();
     const query = (forceQuestion || chatInput).trim();
     if (!query) return;
 
-    // Friendly inline responses for missing API key
-    if (keyState !== 'valid') {
-      const userMessageIdTemplate = `msg-user-${Date.now()}`;
-      const userMessage: ChatMessage = {
-        id: userMessageIdTemplate,
-        sender: 'user',
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        text: query,
-        avatar: 'Patient'
-      };
+    const userMessage: ChatMessage = { id: `msg-user-${Date.now()}`, sender: 'user', timestamp: nowLabel(), text: query };
 
-      const assistantWarningTemplateId = `msg-assistant-warning-${Date.now()}`;
-      const assistantWarning: ChatMessage = {
-        id: assistantWarningTemplateId,
+    const blockedReason = keyState !== 'valid'
+      ? 'Enter a valid Gemini API key in the top bar first. The key stays in this browser session.'
+      : documents.length === 0
+        ? "Upload at least one medical PDF, or click 'Load Sample Medical Files', before asking a question."
+        : null;
+    if (blockedReason) {
+      setMessages(prev => [...prev, userMessage, {
+        id: `msg-assistant-warning-${Date.now()}`,
         sender: 'assistant',
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        timestamp: nowLabel(),
         text: '',
-        error: "Connect API key first. Please provide a valid Gemini API Key in the top-right credentials slot and click the status dot to authenticate. Your key is kept secure inside local memory.",
-        isGenerating: false,
-        readingLevel: readingLevel
-      };
-      setMessages(prev => [...prev, userMessage, assistantWarning]);
-      setChatInput('');
-      return;
-    }
-
-    // Friendly inline responses for missing documents
-    if (documents.length === 0) {
-      const userMessageIdTemplate = `msg-user-${Date.now()}`;
-      const userMessage: ChatMessage = {
-        id: userMessageIdTemplate,
-        sender: 'user',
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        text: query,
-        avatar: 'Patient'
-      };
-
-      const assistantWarningTemplateId = `msg-assistant-warning-${Date.now()}`;
-      const assistantWarning: ChatMessage = {
-        id: assistantWarningTemplateId,
-        sender: 'assistant',
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        text: '',
-        error: "Please upload at least one medical PDF report in the sidebar, or select the clinical 'Load Sample Card Case' option before starting agentic audits.",
-        isGenerating: false,
-        readingLevel: readingLevel
-      };
-      setMessages(prev => [...prev, userMessage, assistantWarning]);
+        error: blockedReason,
+        readingLevel
+      }]);
       setChatInput('');
       return;
     }
@@ -615,141 +400,67 @@ Continue Amlodipine 5 mg PO daily. Continue Atorvastatin 40 mg PO nightly. Next 
     setChatInput('');
     setIsGenerating(true);
 
-    const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-    // Append User Message
-    const userMessageId = `msg-user-${Date.now()}`;
-    const userMessage: ChatMessage = {
-      id: userMessageId,
-      sender: 'user',
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      text: query,
-      avatar: 'Patient'
-    };
-
-    // Append Assistant placeholder containing the collapsible agent trails
     const assistantMessageId = `msg-assistant-${Date.now()}`;
-    const assistantMessage: ChatMessage = {
+    setMessages(prev => [...prev, userMessage, {
       id: assistantMessageId,
       sender: 'assistant',
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      timestamp: nowLabel(),
       text: '',
       isGenerating: true,
-      readingLevel: readingLevel,
-      rawContext: {
-        originalQuestion: query,
-        plan: [],
-        subAnswers: [],
-        conflicts: ""
-      },
-      agentSteps: [
-        { id: 'step-1', name: 'Strategic Inquiry Mapping', status: 'pending', message: 'Formulating focused sub-questions' },
-        { id: 'step-2', name: 'Selective Source Extraction', status: 'pending', message: 'Querying medical records page-by-page' },
-        { id: 'step-3', name: 'Longitudinal Discrepancy Audits', status: 'pending', message: 'Cross-analyzing records for timeline shifts' },
-        { id: 'step-4', name: 'Chief Clinical Synthesis', status: 'pending', message: 'Drafting response under clinical levels' }
-      ]
-    };
+      readingLevel,
+      rawContext: { originalQuestion: query, findings: [], conflicts: '' }
+    }]);
 
-    setMessages(prev => [...prev, userMessage, assistantMessage]);
-    await delay(300); // Allow browser to render the initial pending UI
-
-    // Setup pure React state updates for step transitions
-    const updateLocalStep = (stepId: string, status: 'pending' | 'running' | 'completed' | 'failed', messageText: string, details?: string) => {
-      setMessages(prev => prev.map(m => {
-        if (m.id === assistantMessageId) {
-          const currentSteps = m.agentSteps || [];
-          return {
-            ...m,
-            agentSteps: currentSteps.map(s => s.id === stepId ? { ...s, status, message: messageText, details } : s)
-          };
-        }
-        return m;
-      }));
-    };
-
-    let activeStepId = 'step-1';
+    const docsSnapshot = documents;
     try {
-      // Single-shot: answer from all documents in one Gemini call
-      // This is faster than the 4-step pipeline for small document sets
-      activeStepId = 'step-1';
-      updateLocalStep('step-1', 'running', 'Analyzing documents...');
-      const { finalAnswer, plan, subAnswers, conflicts } = await answerSingleShot(apiKey, query, documents, readingLevel);
-      updateLocalStep('step-1', 'completed', 'Analysis complete.');
-      updateLocalStep('step-2', 'completed', `${subAnswers.length} references found.`);
-      updateLocalStep('step-3', 'completed', conflicts);
-      updateLocalStep('step-4', 'completed', 'Synthesis finished.');
-
-      setMessages(prev => prev.map(m => {
-        if (m.id === assistantMessageId) {
-          return {
+      const { finalAnswer, findings, conflicts, model } = await answerQuestion(apiKey, query, docsSnapshot, readingLevel);
+      setMessages(prev => prev.map(m => m.id === assistantMessageId
+        ? {
             ...m,
             text: finalAnswer,
             isGenerating: false,
-            rawContext: {
-              originalQuestion: query,
-              plan,
-              subAnswers,
-              conflicts
-            }
-          };
-        }
-        return m;
-      }));
-
+            provenance: { model, documentCount: docsSnapshot.length, pageCount: countPages(docsSnapshot) },
+            rawContext: { originalQuestion: query, findings, conflicts }
+          }
+        : m
+      ));
     } catch (error: any) {
-      console.error("Agent Research Pipeline encountered failures:", error);
-      const rawMsg = error?.message || "Internal error occurred.";
-      const userFriendlyMsg = rawMsg.includes("429") || rawMsg.toLowerCase().includes("quota")
-        ? "Gemini free-tier quota is exhausted. AQ. auth keys from AI Studio are valid — this is a usage limit, not a bad key. Wait ~1 minute and retry, check https://ai.dev/rate-limit, or enable billing."
-        : rawMsg;
-      setMessages(prev => prev.map(m => {
-        if (m.id === assistantMessageId) {
-          const currentSteps = m.agentSteps || [];
-          return {
-            ...m,
-            isGenerating: false,
-            error: `API Failure: ${userFriendlyMsg}`,
-            agentSteps: currentSteps.map(s => {
-              if (s.id === activeStepId) {
-                return { ...s, status: 'failed', message: 'Pipeline failed.', details: error?.message };
-              }
-              return s;
-            })
-          };
-        }
-        return m;
-      }));
+      console.error('Question failed:', error);
+      setMessages(prev => prev.map(m => m.id === assistantMessageId
+        ? { ...m, isGenerating: false, error: error?.message || 'The request failed.' }
+        : m
+      ));
     } finally {
       setIsGenerating(false);
     }
   };
 
-  // Re-run raw synthesis instantly when readingLevel is toggled
+  // Rewrite an answer at the other reading level from the findings already returned.
   const handleReadingLevelToggle = async (level: 'simple' | 'clinical', msg: ChatMessage) => {
     if (!msg.rawContext || isGenerating) return;
 
-    // Lock interface
     setIsGenerating(true);
-    setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, isGenerating: true, readingLevel: level } : m));
+    setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, isGenerating: true, notice: undefined } : m));
 
     try {
-      const { originalQuestion, plan, subAnswers, conflicts } = msg.rawContext;
-      const reSynthesized = await synthesizeAnswer(apiKey, originalQuestion, plan, subAnswers, conflicts, level);
-
-      setMessages(prev => prev.map(m => {
-        if (m.id === msg.id) {
-          return {
+      const { originalQuestion, findings, conflicts } = msg.rawContext;
+      const { text, model } = await rewriteAnswer(apiKey, originalQuestion, findings, conflicts, level);
+      setMessages(prev => prev.map(m => m.id === msg.id
+        ? {
             ...m,
-            text: reSynthesized,
+            text,
             isGenerating: false,
-            readingLevel: level
-          };
-        }
-        return m;
-      }));
+            readingLevel: level,
+            provenance: m.provenance ? { ...m.provenance, model } : m.provenance
+          }
+        : m
+      ));
     } catch (err: any) {
-      console.error("Reading level rebuild failed:", err);
-      alert(`Failed to rebuild synthesis level: ${err?.message || "Unknown error"}. Try querying again.`);
+      console.error('Reading-level rewrite failed:', err);
+      setMessages(prev => prev.map(m => m.id === msg.id
+        ? { ...m, isGenerating: false, notice: `Could not rewrite the answer: ${err?.message || 'unknown error'}` }
+        : m
+      ));
     } finally {
       setIsGenerating(false);
     }
@@ -835,7 +546,7 @@ Continue Amlodipine 5 mg PO daily. Continue Atorvastatin 40 mg PO nightly. Next 
           <button
             onClick={() => setIsDarkMode(prev => !prev)}
             className="p-2 bg-slate-50 hover:bg-slate-100 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-lg transition-colors border border-slate-200 dark:border-slate-800 cursor-pointer"
-            title="Toggle contrast levels"
+            title="Toggle dark mode"
           >
             {isDarkMode ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
           </button>
@@ -1058,13 +769,13 @@ Continue Amlodipine 5 mg PO daily. Continue Atorvastatin 40 mg PO nightly. Next 
           </div>
         </section>
 
-        {/* 💬 Right Column: Clinician chat console */}
+        {/* Right column: questions and answers */}
         <section className="w-full md:w-96 flex flex-col bg-white dark:bg-slate-900 border-t md:border-t-0 md:border-l border-slate-200 dark:border-slate-800 overflow-hidden">
 
           {/* Suggested Inquiries segment */}
           <div className="p-4 border-b border-slate-250 dark:border-slate-800 flex-shrink-0">
             <h3 className="text-[10px] font-bold font-mono text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-2">
-              Health Settings
+              Answer style
             </h3>
 
             {/* Simple / Clinical synthesizers toggler */}
@@ -1139,64 +850,13 @@ Continue Amlodipine 5 mg PO daily. Continue Atorvastatin 40 mg PO nightly. Next 
                           : 'bg-slate-900 dark:bg-slate-800 text-white border-transparent shadow-xs'
                         }`}>
 
-                        {/* Collapsible Agent execution tracker step display */}
-                        {isAssistant && msg.agentSteps && (
-                          <div className="mb-4 bg-white/50 dark:bg-slate-950/40 p-3 rounded-md border border-slate-200 dark:border-slate-800">
-                            <details className="group" open={msg.isGenerating}>
-                              <summary className="list-none flex items-center justify-between cursor-pointer focus:outline-hidden">
-                                <div className="flex items-center gap-1.5 text-[10px] font-bold text-slate-700 dark:text-slate-300">
-                                  <BrainCircuit className="w-3.5 h-3.5 text-emerald-500" />
-                                  <span>How we are researching</span>
-                                </div>
-                                <span className="text-[9px] font-mono text-slate-500 dark:text-slate-400 group-open:hidden uppercase font-semibold">Details</span>
-                                <span className="text-[9px] font-mono text-slate-500 dark:text-slate-400 hidden group-open:inline uppercase font-semibold">Hide</span>
-                              </summary>
-
-                              <div className="space-y-2.5 mt-3 pt-2.5 border-t border-slate-200 dark:border-slate-800/80">
-                                {msg.agentSteps.map((s, idx) => (
-                                  <div key={idx} className="flex gap-2.5">
-                                    {/* Line Bullet connection dots styled like professional logs */}
-                                    <div className="flex flex-col items-center">
-                                      <div className={`w-2.5 h-2.5 rounded-full mt-0.5 border border-white dark:border-slate-800 ${s.status === 'completed'
-                                          ? 'bg-emerald-500 dark:bg-emerald-400 shadow-xs'
-                                          : s.status === 'running'
-                                            ? 'bg-amber-400 animate-pulse'
-                                            : s.status === 'failed'
-                                              ? 'bg-rose-500'
-                                              : 'bg-slate-250 dark:bg-slate-700'
-                                        }`} />
-                                      {idx < msg.agentSteps!.length - 1 && (
-                                        <div className="w-[1.5px] bg-slate-200 dark:bg-slate-800/80 flex-1 min-h-[16px] my-0.5" />
-                                      )}
-                                    </div>
-                                    <div className="flex-1 min-w-0">
-                                      <p className="text-[10px] font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1">
-                                        <span>{s.name}</span>
-                                        {s.status === 'running' && <Loader2 className="w-2.5 h-2.5 text-amber-500 animate-spin" />}
-                                      </p>
-                                      <p className="text-[9px] font-medium text-slate-500 dark:text-slate-400 leading-normal mt-0.5">
-                                        {s.message}
-                                      </p>
-                                      {s.details && (
-                                        <pre className="mt-1 p-1.5 bg-slate-100 dark:bg-slate-950 rounded text-[9px] font-mono text-slate-500 whitespace-pre-wrap leading-tight border border-slate-150 dark:border-slate-950/40 max-h-24 overflow-y-auto">
-                                          {s.details}
-                                        </pre>
-                                      )}
-                                    </div>
-                                  </div>
-                                ))}
-                              </div>
-                            </details>
-                          </div>
-                        )}
-
                         {/* Error output */}
                         {msg.error ? (
                           <div className="space-y-2 mt-1">
                             <div className="p-3 bg-rose-50/50 dark:bg-rose-950/25 border border-rose-200/50 text-rose-800 dark:text-rose-450 rounded-lg text-[11px] flex gap-2">
                               <AlertCircle className="w-4 h-4 flex-shrink-0 text-rose-500" />
                               <div className="flex-1">
-                                <p className="font-semibold text-rose-900 dark:text-rose-350">Pipeline Disruption</p>
+                                <p className="font-semibold text-rose-900 dark:text-rose-350">Request failed</p>
                                 <p className="mt-0.5 text-[10.5px] leading-relaxed select-text">{msg.error}</p>
                               </div>
                             </div>
@@ -1205,27 +865,39 @@ Continue Amlodipine 5 mg PO daily. Continue Atorvastatin 40 mg PO nightly. Next 
                                 onClick={() => handleSubmitQuestion(null, msg.rawContext?.originalQuestion)}
                                 className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-bold text-[10px] uppercase rounded-md flex items-center justify-center gap-1.5 cursor-pointer transition-colors shadow-2xs"
                               >
-                                <RefreshCw className="w-3 h-3 animate-spin duration-3000" />
-                                <span>Retry This Investigation</span>
+                                <RefreshCw className="w-3 h-3" />
+                                <span>Retry</span>
                               </button>
                             )}
                           </div>
                         ) : isAssistant && msg.isGenerating && !msg.text ? (
                           <div className="flex items-center gap-2 text-slate-400 dark:text-slate-500 font-mono text-[10px] py-4">
                             <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-500" />
-                            <span>Synthesizing medical findings...</span>
+                            <span>Reading {documents.length} document{documents.length === 1 ? '' : 's'} ({countPages(documents)} pages) in one Gemini request...</span>
                           </div>
                         ) : (
-                          <div className="prose prose-sm dark:prose-invert text-xs text-slate-800 dark:text-slate-100">
-                            {/* Synthesis content */}
+                          <div className="text-xs text-slate-800 dark:text-slate-100">
                             {isAssistant ? (
-                              <div className="whitespace-pre-wrap">
-                                {renderCompilationTextAndCitations(msg.text)}
-                              </div>
+                              <AnswerView text={msg.text} documents={documents} onCitationClick={handleCitationJump} />
                             ) : (
-                              msg.text
+                              <span className="whitespace-pre-wrap">{msg.text}</span>
                             )}
                           </div>
+                        )}
+
+                        {isAssistant && msg.notice && (
+                          <p className="mt-2 text-[10px] text-amber-700 dark:text-amber-400">{msg.notice}</p>
+                        )}
+
+                        {isAssistant && msg.provenance && !msg.isGenerating && (
+                          <details className="mt-3 text-[10px] text-slate-500 dark:text-slate-400">
+                            <summary className="cursor-pointer select-none font-semibold">How this answer was produced</summary>
+                            <ul className="mt-1.5 space-y-1 pl-1">
+                              <li>One <span className="font-mono">{msg.provenance.model}</span> request over {msg.provenance.documentCount} document{msg.provenance.documentCount === 1 ? '' : 's'} ({msg.provenance.pageCount} pages of extracted text).</li>
+                              <li>{msg.rawContext?.findings.length ?? 0} page-level findings returned. Citations are checked against the loaded documents; unverified ones are struck through.</li>
+                              {msg.rawContext?.conflicts && <li>Model's conflict summary: {msg.rawContext.conflicts}</li>}
+                            </ul>
+                          </details>
                         )}
 
                         {/* Layout Simple/Clinical level rebuild selector inside finalized responses */}
@@ -1296,123 +968,4 @@ Continue Amlodipine 5 mg PO daily. Continue Atorvastatin 40 mg PO nightly. Next 
       </div>
     </div>
   );
-
-  // Helper helper to format inline citation links inside message outputs
-  function renderCompilationTextAndCitations(messageText: string) {
-    if (!messageText) return null;
-
-    // Split text into paragraphs nicely
-    const paragraphs = messageText.split(/\n\n+/);
-
-    return (
-      <div className="space-y-3">
-        {paragraphs.map((para, index) => {
-          const trimmed = para.trim();
-          if (!trimmed) return null;
-
-          // Check for discrepancy/contradiction keywords or tags
-          const isContradiction =
-            trimmed.includes('[CONTRADICTION DETECTED]') ||
-            trimmed.includes('[ALERT: CONTRADICTION DETECTED]') ||
-            trimmed.includes('[ALERT: DISCREPANCY DETECTED]') ||
-            trimmed.includes('[DISCREPANCY DETECTED]');
-
-          const isTrend =
-            trimmed.includes('[CHRONOLOGICAL TREND DETECTED]') ||
-            trimmed.includes('[TREND DETECTED]') ||
-            trimmed.includes('[TREND IDENTIFIED]');
-
-          if (isContradiction) {
-            let cleanText = trimmed
-              .replace(/\[CONTRADICTION DETECTED\]/gi, '')
-              .replace(/\[ALERT:\s*CONTRADICTION DETECTED\]/gi, '')
-              .replace(/\[ALERT:\s*DISCREPANCY DETECTED\]/gi, '')
-              .replace(/\[DISCREPANCY DETECTED\]/gi, '')
-              .trim();
-
-            return (
-              <div
-                key={index}
-                className="p-4 bg-rose-50/70 dark:bg-rose-950/20 border-l-4 border-rose-500 rounded-r-lg shadow-2xs space-y-1.5 my-3 relative overflow-hidden"
-              >
-                <div className="flex items-center gap-2 text-rose-800 dark:text-rose-400 font-bold font-sans text-[11px] tracking-tight uppercase">
-                  <AlertCircle className="w-3.5 h-3.5 text-rose-500 flex-shrink-0 animate-pulse" />
-                  <span>Critical Discrepancy Found</span>
-                </div>
-                <div className="text-slate-800 dark:text-slate-200 text-xs leading-relaxed font-medium">
-                  {renderCitationsInString(cleanText)}
-                </div>
-              </div>
-            );
-          }
-
-          if (isTrend) {
-            let cleanText = trimmed
-              .replace(/\[CHRONOLOGICAL TREND DETECTED\]/gi, '')
-              .replace(/\[TREND DETECTED\]/gi, '')
-              .replace(/\[TREND IDENTIFIED\]/gi, '')
-              .trim();
-
-            return (
-              <div
-                key={index}
-                className="p-4 bg-emerald-50/60 dark:bg-emerald-950/20 border-l-4 border-emerald-500 rounded-r-lg shadow-2xs space-y-1.5 my-3 relative overflow-hidden"
-              >
-                <div className="flex items-center gap-2 text-emerald-800 dark:text-emerald-400 font-bold font-sans text-[11px] tracking-tight uppercase">
-                  <Activity className="w-3.5 h-3.5 text-emerald-500 flex-shrink-0" />
-                  <span>Longitudinal Trend Identified</span>
-                </div>
-                <div className="text-slate-800 dark:text-slate-200 text-xs leading-relaxed font-semibold">
-                  {renderCitationsInString(cleanText)}
-                </div>
-              </div>
-            );
-          }
-
-          // Plain paragraph body element
-          return (
-            <p key={index} className="text-xs leading-relaxed text-slate-700 dark:text-slate-200">
-              {renderCitationsInString(para)}
-            </p>
-          );
-        })}
-      </div>
-    );
-  }
-
-  function renderCitationsInString(textSegment: string) {
-    const citationRegex = /\[([^\]]+?),\s*p\.(\d+)\]/gi;
-    const elements = [];
-    let lastOffset = 0;
-    let match;
-
-    while ((match = citationRegex.exec(textSegment)) !== null) {
-      const [fullMatch, docName, pageNumberStr] = match;
-      const matchOffset = match.index;
-
-      if (matchOffset > lastOffset) {
-        elements.push(textSegment.substring(lastOffset, matchOffset));
-      }
-
-      const pNum = parseInt(pageNumberStr);
-      elements.push(
-        <button
-          key={matchOffset}
-          onClick={() => handleCitationJump(docName, pNum)}
-          className="citation-link py-0.5 px-1.5 leading-none mx-0.5 bg-slate-100 hover:bg-emerald-100 dark:bg-slate-850 dark:hover:bg-emerald-950 text-[10px] text-slate-700 dark:text-slate-300 hover:text-emerald-700 dark:hover:text-emerald-300 font-medium font-mono rounded border border-slate-200/50 dark:border-slate-800 transition-colors inline-flex items-center gap-0.5"
-          title={`Jump to ${docName} - Page ${pNum}`}
-        >
-          <span>{docName}, p.{pNum}</span>
-        </button>
-      );
-
-      lastOffset = citationRegex.lastIndex;
-    }
-
-    if (lastOffset < textSegment.length) {
-      elements.push(textSegment.substring(lastOffset));
-    }
-
-    return elements.length > 0 ? elements : textSegment;
-  }
 }

@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react';
 import { TimelineEntry } from '../types';
-import { Calendar, Tag, FileText, ArrowUpDown, ShieldAlert, ArrowRight } from 'lucide-react';
+import { Calendar, FileText, ArrowUpDown, ShieldAlert, ArrowRight } from 'lucide-react';
 
 interface TimelineViewProps {
   entries: TimelineEntry[];
@@ -104,8 +104,6 @@ export default function TimelineView({ entries, onNodeClick }: TimelineViewProps
         ) : (
           <div className="relative border-l border-slate-200 dark:border-slate-800 ml-4 pl-6 space-y-6">
             {processedEntries.map((entry, idx) => {
-              const cleanedTextMatch = entry.event ? entry.event.split(' ')[0] || '' : '';
-              
               return (
                 <div
                   key={`${entry.sourceDocId}-${idx}`}

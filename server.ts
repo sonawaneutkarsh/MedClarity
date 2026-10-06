@@ -1,49 +1,55 @@
 import express from "express";
 import path from "path";
-import { createServer as createViteServer } from "vite";
-import {
-  getKeyStatusResponse,
-  getGeminiResponse,
-  getVerifyKeyResponse,
-} from "./lib/gemini-server.js";
+import { getGeminiResponse, getVerifyKeyResponse } from "./lib/gemini-server.js";
+import { clientKey, geminiLimiter, rateLimitedBody, verifyLimiter, type RateLimiter } from "./lib/rate-limit.js";
+
+function limit(limiter: RateLimiter): express.RequestHandler {
+  return (req, res, next) => {
+    const result = limiter.check(clientKey(req.headers, req.socket.remoteAddress || "unknown"));
+    if (!result.allowed) {
+      res.setHeader("Retry-After", String(result.retryAfterSeconds));
+      res.status(429).json(rateLimitedBody(result.retryAfterSeconds));
+      return;
+    }
+    next();
+  };
+}
 
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT || 3000);
 
-  app.use(express.json({ limit: "20mb" }));
+  // Extracted PDF text only; the PDFs themselves never leave the browser.
+  app.use("/api", express.json({ limit: "4mb" }));
 
-  app.get("/api/key-status", async (req, res) => {
-    const result = await getKeyStatusResponse();
-    return res.status(result.status).json(result.body);
-  });
-
-  app.post("/api/gemini", async (req, res) => {
+  app.post("/api/gemini", limit(geminiLimiter), async (req, res) => {
     const result = await getGeminiResponse(req.body);
-    return res.status(result.status).json(result.body);
+    res.status(result.status).json(result.body);
   });
 
-  app.post("/api/gemini/verify", async (req, res) => {
+  app.post("/api/gemini/verify", limit(verifyLimiter), async (req, res) => {
     const result = await getVerifyKeyResponse(req.body);
-    return res.status(result.status).json(result.body);
+    res.status(result.status).json(result.body);
   });
 
   if (process.env.NODE_ENV !== "production") {
+    // Vite is a dev dependency, so load it only in development.
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
+    const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+    app.get("*", (_req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`Server running on http://localhost:${PORT}`);
   });
 }
 

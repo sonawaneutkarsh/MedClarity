@@ -1,12 +1,43 @@
-import dotenv from "dotenv";
+/**
+ * Server-side Gemini proxy shared by the Express server (server.ts) and the
+ * Vercel functions in api/. The browser never talks to Google directly: it
+ * sends the user's own key plus the prompt here, and this module calls the
+ * Gemini REST API with model fallback and bounded rate-limit retries.
+ *
+ * No server-side key exists. Every request must carry the user's key.
+ */
 
-dotenv.config();
-
-const DEFAULT_GEMINI_MODELS = [
+/**
+ * Models tried in order. The first model that answers wins.
+ * Override with GEMINI_MODELS="model-a,model-b" if Google changes availability.
+ */
+export const DEFAULT_GEMINI_MODELS = [
+  "gemini-3.8-flash",
+  "gemini-3.5-flash-lite",
   "gemini-2.5-flash",
-  "gemini-2.5-flash-lite",
 ];
 
+export function getConfiguredModels(env: Record<string, string | undefined> = process.env): string[] {
+  const fromEnv = (env.GEMINI_MODELS || "")
+    .split(",")
+    .map(m => m.trim())
+    .filter(Boolean);
+  return fromEnv.length > 0 ? fromEnv : DEFAULT_GEMINI_MODELS;
+}
+
+/** Largest prompt + system instruction the proxy forwards (characters). */
+export const MAX_PROMPT_CHARS = 1_000_000;
+
+/** Upper bound for a single RetryInfo wait, so one request cannot hang the function. */
+export const MAX_RETRY_DELAY_MS = 8000;
+
+/** Attempts per model when Google answers with a quota / rate-limit error. */
+export const MAX_ATTEMPTS_PER_MODEL = 2;
+
+/**
+ * Accepts what people actually paste: a bare key, a quoted key, or a whole
+ * `GEMINI_API_KEY="..."` line, and returns only the key.
+ */
 export function normalizeGeminiKey(key: string): string {
   let normalized = (key || "").trim();
   const assignmentMatch = normalized.match(/^(?:export\s+)?(?:GEMINI_API_KEY|GOOGLE_API_KEY|VITE_GEMINI_API_KEY)\s*=\s*(.+)$/i);
@@ -40,36 +71,31 @@ export function normalizeGeminiKey(key: string): string {
   return normalized;
 }
 
-export function isMockKey(key: string): boolean {
-  const trimmed = normalizeGeminiKey(key).toLowerCase();
-  return !trimmed ||
-    trimmed.includes("test") ||
-    trimmed.includes("mock") ||
-    trimmed.includes("dummy") ||
-    trimmed === "valid_key" ||
-    trimmed === "valid-key" ||
-    trimmed === "valid";
+/** Rejects obvious placeholders ("test", "YOUR_GEMINI_API_KEY", ...) before a network call. */
+export function isPlaceholderKey(key: string): boolean {
+  const k = normalizeGeminiKey(key).toLowerCase();
+  if (!k) return true;
+  if (/^(test|mock|dummy|fake|valid|placeholder|changeme)([_-]?(api[_-]?)?key)?$/.test(k)) return true;
+  return /^(your|my)[_-]?(gemini[_-]?)?api[_-]?key$/.test(k);
 }
 
 export function getFetchUrlAndHeaders(apiKey: string, model: string) {
   const trimmed = normalizeGeminiKey(apiKey);
-  const isAccessToken = trimmed.startsWith("ya29.");
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+  return { url, headers: authHeaders(trimmed) };
+}
+
+function authHeaders(key: string): Record<string, string> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-
-  if (isAccessToken) {
-    headers["Authorization"] = `Bearer ${trimmed}`;
+  if (key.startsWith("ya29.")) {
+    headers["Authorization"] = `Bearer ${key}`;
   } else {
-    headers["x-goog-api-key"] = trimmed;
+    headers["x-goog-api-key"] = key;
   }
-
-  return { url, headers };
+  return headers;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
+/** Reads Google's RetryInfo (or "retry in Ns" text) and caps the wait. */
 export function parseRetryDelayMs(errorText: string): number {
   try {
     const parsed = JSON.parse(errorText);
@@ -79,19 +105,19 @@ export function parseRetryDelayMs(errorText: string): number {
     if (retryInfo?.retryDelay) {
       const seconds = parseFloat(String(retryInfo.retryDelay).replace(/s$/, ""));
       if (!Number.isNaN(seconds) && seconds > 0) {
-        return Math.min(Math.ceil(seconds * 1000), 8000);
+        return Math.min(Math.ceil(seconds * 1000), MAX_RETRY_DELAY_MS);
       }
     }
 
     const messageMatch = parsed?.error?.message?.match(/retry in ([\d.]+)s/i);
     if (messageMatch?.[1]) {
-      return Math.min(Math.ceil(parseFloat(messageMatch[1]) * 1000), 8000);
+      return Math.min(Math.ceil(parseFloat(messageMatch[1]) * 1000), MAX_RETRY_DELAY_MS);
     }
   } catch {
-    // Fall through to default delay.
+    // Not JSON: fall through to the default delay.
   }
 
-  return 8000;
+  return MAX_RETRY_DELAY_MS;
 }
 
 export function isQuotaOrRateLimitError(status: number, errorText: string): boolean {
@@ -102,333 +128,213 @@ export function isQuotaOrRateLimitError(status: number, errorText: string): bool
     normalized.includes("rate limit");
 }
 
-export function generateMockResponse(systemInstruction: string, prompt: string, isJson: boolean): string {
-  const sysLower = (systemInstruction || "").toLowerCase();
-  const promptLower = (prompt || "").toLowerCase();
-
-  if (sysLower.includes("planning") || sysLower.includes("clinical developer planning")) {
-    const docIds: string[] = [];
-    const matches = prompt.match(/Document ID:\s*"([^"]+)"/g) || prompt.match(/"id":\s*"([^"]+)"/g) || [];
-    for (const m of matches) {
-      const match = m.match(/"([^"]+)"/);
-      if (match && match[1] && match[1] !== "id" && match[1] !== "Document ID:") {
-        if (!docIds.includes(match[1])) docIds.push(match[1]);
-      }
-    }
-    if (docIds.length === 0) {
-      docIds.push("doc-1", "doc-2");
-    }
-
-    const plan = [
-      {
-        question: "Compare lipid panels, cholesterol values, and cardiac health indicators chronologically.",
-        relevantDocIds: docIds
-      },
-      {
-        question: "Review diagnostic conclusions, follow-up directions, and primary physician summaries.",
-        relevantDocIds: docIds
-      },
-      {
-        question: "Identify differences in daily dosage instructions or active medication list conflicts.",
-        relevantDocIds: docIds
-      }
-    ];
-    return JSON.stringify(plan);
-  }
-
-  if (sysLower.includes("expert clinical investigator") && sysLower.includes("truthfulness")) {
-    let docName = "Clinical File";
-    const nameMatch = prompt.match(/Document Name:\s*"([^"]+)"/);
-    if (nameMatch && nameMatch[1]) {
-      docName = nameMatch[1];
-    }
-
-    let answer = `According to the ${docName}, the patient underwent diagnostic reviews which demonstrated stable vitals and appropriate physiologic parameters. All active values align with expectations for cardiac recovery, with zero immediate clinical contradictions flagged.`;
-    if (promptLower.includes("lipid") || promptLower.includes("cholesterol") || promptLower.includes("lab")) {
-      answer = `A diagnostic check from the ${docName} lists total cholesterol, LDL, and triglyceride levels. Total cholesterol is tracked at 215 mg/dL with LDL at 135 mg/dL. These numbers represent standard therapeutic ranges or exhibit acceptable baseline control post-treatment.`;
-    } else if (promptLower.includes("medication") || promptLower.includes("dosage") || promptLower.includes("prescribe")) {
-      answer = `The active pharmacological plan detailed in ${docName} includes Atorvastatin (40mg once daily) and Lisinopril (10mg daily) to optimize metabolic and blood pressure metrics. Compliance is well-tolerated with zero reported contraindications.`;
-    }
-
-    return JSON.stringify({
-      answer,
-      pageNumber: 1
-    });
-  }
-
-  if (sysLower.includes("clinical data safety officer") || sysLower.includes("discrepancies")) {
-    return `[CHRONOLOGICAL TREND DETECTED]
-A cross-sectional comparison of findings shows a positive therapeutic trajectory.
-From the initial evaluation to the subsequent lab test:
-- **Cardiovascular Vitals**: SBP was elevated at 145/90 initially, but declined to 125/80 after medical adjustments.
-- **Lipid Optimization**: Lipid parameters demonstrate improved LDL control (155 mg/dL down to 110 mg/dL), reflecting therapeutic response to Statins.
-- **Medications**: Medication compliance is confirmed across all sources. No active dose contradictions detected.`;
-  }
-
-  if (sysLower.includes("medical record guide") || promptLower.includes("suggested expert health inquiries") || promptLower.includes("high-utility comparison questions")) {
-    return JSON.stringify({
-      questions: [
-        "How do lab indicators compare chronologically?",
-        "Are there any changes in medication dosages?",
-        "Were any diagnostic differences noted in follow-ups?",
-        "Are active care plans fully aligned between providers?"
-      ]
-    });
-  }
-
-  if (sysLower.includes("clinical historical archivist") || promptLower.includes("key clinical occurrences")) {
-    const timelineData = {
-      events: [
-        {
-          date: "Feb 12, 2026",
-          isoDate: "2026-02-12",
-          event: "Initial comprehensive evaluation and baseline physical completed.",
-          pageNumber: 1,
-          type: "general"
-        },
-        {
-          date: "Feb 15, 2026",
-          isoDate: "2026-02-15",
-          event: "Lipid panel results show elevated LDL cholesterol at 155 mg/dL.",
-          pageNumber: 1,
-          type: "lab_result"
-        },
-        {
-          date: "Feb 20, 2026",
-          isoDate: "2026-02-20",
-          event: "Initiated Lisinopril 10mg daily and Atorvastatin 20mg daily.",
-          pageNumber: 1,
-          type: "treatment"
-        },
-        {
-          date: "Mar 15, 2026",
-          isoDate: "2026-03-15",
-          event: "Follow-up clinical assessment confirms vitals are well-controlled.",
-          pageNumber: 1,
-          type: "clinical_finding"
-        }
-      ]
-    };
-    return JSON.stringify(timelineData);
-  }
-
-  if (sysLower.includes("medical dictionary") || sysLower.includes("translate complex medical terms")) {
-    const termMatch = prompt.match(/Term to define:\s*"([^"]+)"/);
-    const term = termMatch ? termMatch[1] : "this term";
-
-    const tLower = term.toLowerCase();
-    if (tLower.includes("atorvastatin") || tLower.includes("statin")) {
-      return `Atorvastatin is a common prescription medication (belonging to the class of drugs called statins) used to lower cholesterol levels and reduce the risk of cardiovascular events like heart attacks.`;
-    }
-    if (tLower.includes("lisinopril") || tLower.includes("ace inhibitor")) {
-      return `Lisinopril is a widely used prescription blood pressure medication (an ACE inhibitor) that works by relaxing blood vessels to help lower high blood pressure and improve cardiac function.`;
-    }
-    if (tLower.includes("ldl") || tLower.includes("lipoprotein")) {
-      return `Low-Density Lipoprotein (LDL) is often referred to as "bad cholesterol" because high levels of it can lead to plaque buildup in your arteries over time, increasing cardiac risks.`;
-    }
-    if (tLower.includes("hdl")) {
-      return `High-Density Lipoprotein (HDL) is known as "good cholesterol" because it helps clear other forms of cholesterol from your bloodstream, protecting your cardiovascular health.`;
-    }
-    return `"${term}" is a clinical medical indicator or diagnostic term used in patient records to help care teams evaluate cardiac stability, physical function, or metabolic status.`;
-  }
-
-  if (sysLower.includes("chief medical officer") || sysLower.includes("consultation output")) {
-    const isClinical = sysLower.includes("clinical") || prompt.includes("clinical") || prompt.includes("CLINICAL");
-    if (isClinical) {
-      return `[TREND IDENTIFIED] Cardiovascular and lipid optimization.
-
-### Diagnostic Analysis & Clinical Correlation
-A comprehensive clinical synthesis of findings has been performed across the uploaded reports. Results suggest favorable prognostic trends and excellent compliance with primary treatments:
-- **Metabolic Indicators**: Serum cholesterol assessments demonstrate expected therapeutic control. Chronological profiling reveals appropriate reduction of circulating lipid components [Medical Records, p.1].
-- **Hemodynamic Parameters**: Vital signs, specifically blood pressure metrics, reflect adequate control under the active antihypertensive regimen [Clinical Summary, p.1].
-- **Medication Reconciliation**: Cross-document checks indicate absolute alignment between clinical orders, eliminating any potential active compounding conflicts.
-
-### Pathophysiological Recommendations
-1. Maintain existing HMG-CoA reductase inhibitor (Statin) and ACE-inhibitor doses.
-2. Monitor renal function and serum electrolytes in next periodic screening.
-3. Schedule primary follow-up in 3 months.`;
-    }
-
-    return `[TREND IDENTIFIED] General improvement in vitals and lab numbers.
-
-### Executive Summary & Review
-I have carefully compared your uploaded health documents. Here is a clear, patient-friendly summary of how they compare:
-- **Cardiovascular Health**: Your blood pressure readings are showing visible progress. The readings are now normal and stabilized under your daily medications [Clinical Summary, p.1].
-- **Lab Numbers**: Your bad cholesterol (LDL) has dropped significantly from the initial report to your latest set of test results, demonstrating that the cholesterol-lowering medication is working as expected [Medical Records, p.1].
-- **Medications**: Your prescription details listed are accurate and consistent across all pages, meaning there are no active medication disagreements or double prescriptions.
-
-### Next Steps & Recommendations
-- Keep taking your daily prescribed blood pressure and cholesterol-lowering medications exactly as directed.
-- Schedule a routine follow-up with your doctor as planned in a few weeks to review your ongoing progress.
-- Feel free to look up any other terms in the reports by clicking on them inside MedClarity!`;
-  }
-
-  if (isJson) {
-    return JSON.stringify({
-      answer: "No data detected or API connection issue. Please verify your Gemini API key in Settings.",
-      pageNumber: 1
-    });
-  }
-
-  return "MedClarity analyzed your clinical files successfully. All values appear stable and aligned across records. No immediate alerts are detected.";
+/** Concatenates the answer text parts of a generateContent response (skips thought parts). */
+export function extractResponseText(result: any): string {
+  const parts: any[] = result?.candidates?.[0]?.content?.parts || [];
+  return parts
+    .filter(p => typeof p?.text === "string" && !p.thought)
+    .map(p => p.text)
+    .join("");
 }
 
-async function generateWithModel(
-  apiKeyToUse: string,
-  model: string,
-  systemInstruction: string,
-  prompt: string,
-  isJson: boolean
-): Promise<{ text: string } | { error: string; status: number; retryable: boolean }> {
-  const { url, headers } = getFetchUrlAndHeaders(apiKeyToUse, model);
-
-  const payload: any = {
-    contents: [
-      {
-        parts: [{ text: prompt }]
-      }
-    ],
-    generationConfig: {
-      temperature: isJson ? 0.1 : 0.4,
-    }
-  };
-
-  if (systemInstruction) {
-    payload.systemInstruction = {
-      parts: [{ text: systemInstruction }]
-    };
-  }
-
-  if (isJson) {
-    payload.generationConfig.responseMimeType = "application/json";
-
-    const isSingleShotAnswer = (systemInstruction || "").toLowerCase().includes("chief medical officer");
-    if (isSingleShotAnswer) {
-      payload.generationConfig.responseSchema = {
+/** JSON schema for the question-answering call (see src/lib/gemini.ts answerQuestion). */
+export const ANSWER_RESPONSE_SCHEMA = {
+  type: "object",
+  properties: {
+    finalAnswer: { type: "string" },
+    findings: {
+      type: "array",
+      items: {
         type: "object",
         properties: {
-          finalAnswer: { type: "string" },
-          plan: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                question: { type: "string" },
-                relevantDocIds: { type: "array", items: { type: "string" } }
-              }
-            }
-          },
-          subAnswers: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                subQuestion: { type: "string" },
-                docId: { type: "string" },
-                docName: { type: "string" },
-                pageNumber: { type: "number" },
-                answer: { type: "string" }
-              }
-            }
-          },
-          conflicts: { type: "string" }
+          docName: { type: "string" },
+          pageNumber: { type: "number" },
+          finding: { type: "string" }
         },
-        required: ["finalAnswer"]
-      };
+        required: ["docName", "pageNumber", "finding"]
+      }
+    },
+    conflicts: { type: "string" }
+  },
+  required: ["finalAnswer"]
+};
+
+const RESPONSE_SCHEMAS: Record<string, object> = {
+  answer: ANSWER_RESPONSE_SCHEMA,
+};
+
+export interface GeminiRequestBody {
+  systemInstruction?: string;
+  prompt?: string;
+  isJson?: boolean;
+  responseSchema?: string;
+  customApiKey?: string;
+}
+
+export interface ProxyResult {
+  status: number;
+  body: Record<string, unknown>;
+}
+
+export interface ProxyDeps {
+  fetchImpl?: typeof fetch;
+  sleep?: (ms: number) => Promise<void>;
+  models?: string[];
+}
+
+const defaultSleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+/** Returns an error result for a malformed or oversized request, or null when it is acceptable. */
+export function validateGeminiRequest(body: unknown): ProxyResult | null {
+  if (!body || typeof body !== "object") {
+    return { status: 400, body: { error: "Request body must be a JSON object." } };
+  }
+  const b = body as GeminiRequestBody;
+  if (typeof b.prompt !== "string" || !b.prompt.trim()) {
+    return { status: 400, body: { error: "Missing prompt." } };
+  }
+  if (b.systemInstruction !== undefined && typeof b.systemInstruction !== "string") {
+    return { status: 400, body: { error: "systemInstruction must be a string." } };
+  }
+  const size = b.prompt.length + (b.systemInstruction || "").length;
+  if (size > MAX_PROMPT_CHARS) {
+    return {
+      status: 413,
+      body: { error: `The documents are too large for one request (${size.toLocaleString("en-US")} characters, limit ${MAX_PROMPT_CHARS.toLocaleString("en-US")}). Remove some documents and try again.` }
+    };
+  }
+  if (b.responseSchema !== undefined && !(b.responseSchema in RESPONSE_SCHEMAS)) {
+    return { status: 400, body: { error: `Unknown responseSchema "${b.responseSchema}".` } };
+  }
+  return null;
+}
+
+type ModelResult = { text: string } | { error: string; status: number };
+
+async function generateWithModel(
+  apiKey: string,
+  model: string,
+  body: GeminiRequestBody,
+  deps: Required<Omit<ProxyDeps, "models">>
+): Promise<ModelResult> {
+  const { url, headers } = getFetchUrlAndHeaders(apiKey, model);
+  const isJson = !!body.isJson;
+
+  const payload: any = {
+    contents: [{ parts: [{ text: body.prompt || "" }] }],
+    generationConfig: { temperature: isJson ? 0.1 : 0.4 },
+  };
+  if (body.systemInstruction) {
+    payload.systemInstruction = { parts: [{ text: body.systemInstruction }] };
+  }
+  if (isJson) {
+    payload.generationConfig.responseMimeType = "application/json";
+    if (body.responseSchema) {
+      payload.generationConfig.responseSchema = RESPONSE_SCHEMAS[body.responseSchema];
     }
   }
 
-  const maxAttempts = 3;
   let lastErrorText = "";
-
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const response = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload)
-    });
+  let lastStatus = 0;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS_PER_MODEL; attempt++) {
+    const response = await deps.fetchImpl(url, { method: "POST", headers, body: JSON.stringify(payload) });
 
     if (response.ok) {
       const result = await response.json();
-      const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (text) {
-        return { text };
+      const text = extractResponseText(result);
+      if (text) return { text };
+      return { error: `Model ${model} returned no text (finishReason: ${result?.candidates?.[0]?.finishReason ?? "unknown"}).`, status: 502 };
+    }
+
+    lastStatus = response.status;
+    lastErrorText = await response.text();
+    if (isQuotaOrRateLimitError(response.status, lastErrorText) && attempt < MAX_ATTEMPTS_PER_MODEL - 1) {
+      await deps.sleep(parseRetryDelayMs(lastErrorText));
+      continue;
+    }
+    break;
+  }
+
+  return { error: `HTTP ${lastStatus} from model ${model}: ${lastErrorText}`, status: lastStatus };
+}
+
+/** POST /api/gemini */
+export async function getGeminiResponse(body: unknown, deps: ProxyDeps = {}): Promise<ProxyResult> {
+  try {
+    const invalid = validateGeminiRequest(body);
+    if (invalid) return invalid;
+    const b = body as GeminiRequestBody;
+
+    const apiKey = normalizeGeminiKey(b.customApiKey || "");
+    if (!apiKey) {
+      return { status: 400, body: { error: "Enter your Gemini API key in the top bar before asking a question." } };
+    }
+
+    const resolved = {
+      fetchImpl: deps.fetchImpl ?? fetch,
+      sleep: deps.sleep ?? defaultSleep,
+    };
+    const models = deps.models ?? getConfiguredModels();
+
+    let lastError = "";
+    let sawQuota = false;
+    for (const model of models) {
+      const result = await generateWithModel(apiKey, model, b, resolved);
+      if ("text" in result) {
+        return { status: 200, body: { text: result.text, model } };
       }
+      console.warn(`Gemini model ${model} failed:`, result.error.slice(0, 500));
+      lastError = result.error;
+      if (isQuotaOrRateLimitError(result.status, result.error)) sawQuota = true;
+    }
+
+    if (lastError.includes("ACCESS_TOKEN_TYPE_UNSUPPORTED")) {
       return {
-        error: `Model ${model} returned empty/malformed parts: ${JSON.stringify(result)}`,
         status: 502,
-        retryable: false
+        body: {
+          error: "Google rejected this AQ. auth key with ACCESS_TOKEN_TYPE_UNSUPPORTED. " +
+            "This is an issue on Google's side for some new auth keys. Generate a fresh key in AI Studio, " +
+            "or use a standard AIzaSy... API key."
+        }
       };
     }
 
-    lastErrorText = await response.text();
-    const retryable = isQuotaOrRateLimitError(response.status, lastErrorText);
-    if (retryable && attempt < maxAttempts - 1) {
-      const delayMs = parseRetryDelayMs(lastErrorText);
-      console.warn(`Model ${model} hit rate limit (attempt ${attempt + 1}/${maxAttempts}). Retrying in ${delayMs}ms.`);
-      await sleep(delayMs);
-      continue;
-    }
-
     return {
-      error: `HTTP ${response.status} from model ${model}: ${lastErrorText}`,
-      status: response.status,
-      retryable
+      status: sawQuota ? 429 : 502,
+      body: { error: lastError || "All Gemini models failed to respond." }
     };
-  }
-
-  return {
-    error: `HTTP 429 from model ${model}: ${lastErrorText}`,
-    status: 429,
-    retryable: true
-  };
-}
-
-export async function getKeyStatusResponse() {
-  // Judges must enter their own key in the app — never auto-connect from server secrets.
-  return { status: 200, body: { hasKey: false, isDemo: false } };
-}
-
-export async function getVerifyKeyResponse(body: any) {
-  try {
-    const keyToTest = normalizeGeminiKey(body?.apiKey || "");
-    const verification = await verifyGeminiKey(keyToTest);
-    return { status: 200, body: verification };
   } catch (err: any) {
-    console.error("Server-side key verification error:", err);
-    return {
-      status: 200,
-      body: { isValid: false, reason: err.message || "Failed verification probe." }
-    };
+    console.error("Gemini proxy error:", err);
+    return { status: 500, body: { error: err?.message || "Unknown Gemini proxy error." } };
   }
 }
 
-export async function verifyGeminiKey(keyToTest: string): Promise<{ isValid: boolean; reason?: string }> {
-  keyToTest = normalizeGeminiKey(keyToTest);
-  if (!keyToTest) {
-    return { isValid: false, reason: "Empty key" };
+/**
+ * Checks a key with a models.list call. This does not depend on access to any
+ * particular model and does not spend generation quota.
+ */
+export async function verifyGeminiKey(
+  keyToTest: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<{ isValid: boolean; reason?: string }> {
+  const key = normalizeGeminiKey(keyToTest);
+  if (!key) {
+    return { isValid: false, reason: "Empty key." };
   }
-
-  if (isMockKey(keyToTest)) {
+  if (isPlaceholderKey(key)) {
     return { isValid: false, reason: "Enter a real Gemini API key from Google AI Studio." };
   }
 
   try {
-    const { url, headers } = getFetchUrlAndHeaders(keyToTest, "gemini-2.5-flash");
-    const response = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: "Say ok" }] }]
-      })
+    const response = await fetchImpl("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1", {
+      method: "GET",
+      headers: authHeaders(key),
     });
-
     if (response.ok) {
       return { isValid: true };
     }
 
     const errStr = await response.text();
-    console.warn("Verify probe failed with:", errStr);
     let googleReason = "";
     try {
       const parsed = JSON.parse(errStr);
@@ -440,90 +346,34 @@ export async function verifyGeminiKey(keyToTest: string): Promise<{ isValid: boo
     if (googleReason === "API_KEY_SERVICE_BLOCKED") {
       return {
         isValid: false,
-        reason: "Key is blocked from the Gemini API. Enable Generative Language API or use an unrestricted Google AI Studio key."
+        reason: "This key is blocked from the Gemini API. Enable the Generative Language API or use an unrestricted AI Studio key."
       };
     }
-
     if (errStr.includes("ACCESS_TOKEN_TYPE_UNSUPPORTED")) {
       return {
         isValid: false,
-        reason: "Google rejected this AQ. auth key (ACCESS_TOKEN_TYPE_UNSUPPORTED). This is a known open issue " +
-          "with some new Google AI Studio auth keys, not a problem with this app. Try generating a fresh key."
+        reason: "Google rejected this AQ. auth key (ACCESS_TOKEN_TYPE_UNSUPPORTED). Generate a fresh key or use an AIzaSy... key."
       };
     }
-
-    if (response.status === 400 || response.status === 401 || response.status === 403) {
-      return { isValid: false, reason: `API Status ${response.status}: Authorized check failed.` };
-    }
-
     if (isQuotaOrRateLimitError(response.status, errStr)) {
-      return {
-        isValid: true,
-        reason: "Key is valid, but Gemini free-tier quota is currently exhausted."
-      };
+      return { isValid: true, reason: "Key accepted, but the Gemini quota for this key is currently exhausted." };
     }
-
-    return { isValid: true };
+    if (response.status === 400 || response.status === 401 || response.status === 403) {
+      return { isValid: false, reason: `Google rejected the key (HTTP ${response.status}).` };
+    }
+    return { isValid: false, reason: `Could not verify the key: Google returned HTTP ${response.status}. Try again shortly.` };
   } catch (err: any) {
-    return { isValid: false, reason: `Network error verifying key: ${err.message}` };
+    return { isValid: false, reason: `Network error while verifying the key: ${err?.message || err}` };
   }
 }
 
-export async function getGeminiResponse(body: any) {
+/** POST /api/gemini/verify. Always 200 with { isValid, reason } unless the server itself fails. */
+export async function getVerifyKeyResponse(body: any, fetchImpl: typeof fetch = fetch): Promise<ProxyResult> {
   try {
-    const { systemInstruction, prompt, isJson, customApiKey } = body || {};
-
-    const apiKeyToUse = normalizeGeminiKey(customApiKey || "");
-    if (!apiKeyToUse) {
-      return {
-        status: 400,
-        body: { error: "Enter your Gemini API key in the top bar before running MedClarity." }
-      };
-    }
-
-    const modelsToTry = DEFAULT_GEMINI_MODELS;
-    let lastError: any = null;
-
-    for (const model of modelsToTry) {
-      const result = await generateWithModel(
-        apiKeyToUse,
-        model,
-        systemInstruction || "",
-        prompt || "",
-        !!isJson
-      );
-
-      if ("text" in result) {
-        return { status: 200, body: { text: result.text } };
-      }
-
-      console.warn(`Attempt with model ${model} failed:`, result.error);
-      lastError = new Error(result.error);
-    }
-
-    const lastMsg = lastError?.message || "";
-    if (lastMsg.includes("ACCESS_TOKEN_TYPE_UNSUPPORTED")) {
-      return {
-        status: 502,
-        body: {
-          error: "Google rejected this AQ. auth key with ACCESS_TOKEN_TYPE_UNSUPPORTED. " +
-            "This is a known, currently-unresolved issue on Google's side affecting some new auth keys " +
-            "(see the Gemini API developer forum, issue #2391). It is not something this app's code can " +
-            "work around. Try generating a fresh key in AI Studio, or check " +
-            "https://discuss.ai.google.dev for the latest status."
-        }
-      };
-    }
-
-    return {
-      status: 502,
-      body: { error: lastMsg || "All Gemini models failed to respond." }
-    };
+    const verification = await verifyGeminiKey(typeof body?.apiKey === "string" ? body.apiKey : "", fetchImpl);
+    return { status: 200, body: verification };
   } catch (err: any) {
-    console.error("Server-side Gemini proxy error:", err);
-    return {
-      status: 500,
-      body: { error: err.message || "Unknown server-side Gemini proxy error." }
-    };
+    console.error("Key verification error:", err);
+    return { status: 500, body: { isValid: false, reason: err?.message || "Key verification failed." } };
   }
 }
